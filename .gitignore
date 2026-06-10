@@ -1,0 +1,16 @@
+## Swift / SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj
+*.xcworkspace
+
+## Xcode (incl. CLI xcodebuild derived data)
+/.xcode-build/
+xcuserdata/
+DerivedData/
+*.xcuserstate
+default.profraw
+
+## macOS
+.DS_Store
