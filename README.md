@@ -26,4 +26,9 @@ let resp = try await engine.run(ImageUpscaleRequest(image: smallImage)) as! Imag
 // resp.image — 4× .png; resp.appliedScale == 4
 ```
 
+## Consuming it
+
+Public + version-tagged on github.com/xocialize. Add by tagged URL:
+`.package(url: "https://github.com/xocialize/mlx-realesrgan-swift", from: "0.1.0")`, then import `MLXRealESRGAN` (the conformant `imageUpscale` package). Builds standalone — its engine contract (`MLXToolKit`) and model-core dependencies are tagged-URL net deps, no local checkouts.
+
 Requirements: macOS 26+ (Apple Silicon, Metal GPU). Port MIT; weights BSD-3 (xinntao/Real-ESRGAN).
