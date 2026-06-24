@@ -61,6 +61,54 @@ struct RealESRGANUpscaleTests {
         #expect(back.prefix(4) == Data([0x89, 0x50, 0x4E, 0x47]))
     }
 
+    // MARK: - rawBGRA8 (contract 1.9.0)
+
+    @Test func rawBGRA8RoundTripsBitIdentical() throws {
+        let w = 8, h = 4
+        let bytes = Data((0..<(w * h * 4)).map { UInt8($0 % 256) })
+        let image = Image.rawBGRA8(data: bytes, width: w, height: h)
+        let pb = try RealESRGANUpscalePackage.decodeToPixelBuffer(image)
+        #expect(CVPixelBufferGetWidth(pb) == w && CVPixelBufferGetHeight(pb) == h)
+        let back = try #require(RealESRGANUpscalePackage.encodeRawBGRA8(pb))
+        #expect(back.format == .rawBGRA8)
+        #expect(back.width == w && back.height == h && back.bytesPerRow == nil)
+        #expect(back.data == bytes)
+    }
+
+    @Test func rawBGRA8HonorsSourceStride() throws {
+        let w = 5, h = 3
+        let stride = w * 4 + 16
+        var src = Data(count: stride * h)
+        for row in 0..<h {
+            for col in 0..<(w * 4) { src[row * stride + col] = UInt8((row * 40 + col) % 256) }
+        }
+        let image = Image.rawBGRA8(data: src, width: w, height: h, bytesPerRow: stride)
+        let pb = try RealESRGANUpscalePackage.decodeToPixelBuffer(image)
+        let back = try #require(RealESRGANUpscalePackage.encodeRawBGRA8(pb))
+        #expect(back.data.count == w * 4 * h)
+        for row in 0..<h {
+            let expected = src.subdata(in: (row * stride)..<(row * stride + w * 4))
+            let got = back.data.subdata(in: (row * w * 4)..<((row + 1) * w * 4))
+            #expect(got == expected)
+        }
+    }
+
+    @Test func rawBGRA8MissingDimensionsThrows() {
+        let image = Image(format: .rawBGRA8, data: Data(count: 16))
+        #expect(throws: RealESRGANPackageError.self) {
+            _ = try RealESRGANUpscalePackage.decodeToPixelBuffer(image)
+        }
+    }
+
+    @Test func pngAndRawBGRA8DecodeToSamePixels() throws {
+        let png = try #require(Self.makePNG(width: 16, height: 16))
+        let viaPNG = try RealESRGANUpscalePackage.decodeToPixelBuffer(Image(format: .png, data: png, width: 16, height: 16))
+        let raw = try #require(RealESRGANUpscalePackage.encodeRawBGRA8(viaPNG))
+        let viaRaw = try RealESRGANUpscalePackage.decodeToPixelBuffer(raw)
+        let reRaw = try #require(RealESRGANUpscalePackage.encodeRawBGRA8(viaRaw))
+        #expect(reRaw.data == raw.data)
+    }
+
     static func makePNG(width: Int, height: Int) -> Data? {
         guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
                                   bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
