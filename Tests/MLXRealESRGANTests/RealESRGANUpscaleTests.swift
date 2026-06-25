@@ -109,6 +109,27 @@ struct RealESRGANUpscaleTests {
         #expect(reRaw.data == raw.data)
     }
 
+    // MARK: - scale honoring (BRIDGE-029)
+
+    /// `resizePixelBuffer` (the sub-native `scale` path) yields the requested dimensions as a valid
+    /// 32BGRA buffer. The full `run()` honoring (native-4× → downsample to `inputDim * scale`) is
+    /// proven live in the `MLXEngine Testing` app; this pins the offline-testable resize math.
+    @Test func resizePixelBufferProducesRequestedDimensions() throws {
+        // Stand in for a native-4× result: a 64×64 BGRA buffer (≡ 16×16 input upscaled 4×).
+        let png = try #require(Self.makePNG(width: 64, height: 64))
+        let nativePB = try RealESRGANUpscalePackage.decodeToPixelBuffer(
+            Image(format: .png, data: png, width: 64, height: 64))
+        // Requesting scale 2 on the 16×16 input ⇒ 32×32 (= 16 × 2), not the native 64×64 (= 16 × 4).
+        let scaled = try RealESRGANUpscalePackage.resizePixelBuffer(nativePB, toWidth: 32, height: 32)
+        #expect(CVPixelBufferGetWidth(scaled) == 32)
+        #expect(CVPixelBufferGetHeight(scaled) == 32)
+        #expect(CVPixelBufferGetPixelFormatType(scaled) == kCVPixelFormatType_32BGRA)
+        // Encodes cleanly as raw BGRA8 at the downsampled size (tightly packed 32×32×4).
+        let raw = try #require(RealESRGANUpscalePackage.encodeRawBGRA8(scaled))
+        #expect(raw.width == 32 && raw.height == 32)
+        #expect(raw.data.count == 32 * 32 * 4)
+    }
+
     static func makePNG(width: Int, height: Int) -> Data? {
         guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
                                   bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,

@@ -21,8 +21,9 @@ public enum RealESRGANPackageError: Error, Equatable {
 /// all model logic (SRVGGNet, 64² tiling with feathered seams, NHWC) lives there. All variants
 /// are vendored in the core bundle — `load()` involves **no download**.
 ///
-/// Native scale is **4×**: a request's `scale` of `nil` or `4` is honored; the response's
-/// `appliedScale` always reports what ran (per the contract, callers verify it).
+/// Native scale is **4×**. A request's `scale` of `nil` or `≥ 4` runs at native 4×; a sub-native
+/// `scale` (e.g. `2`) is honored by post-downsampling the native-4× result to `inputDim * scale`.
+/// The response's `appliedScale` always reports what actually ran (per the contract, callers verify it).
 @InferenceActor
 public final class RealESRGANUpscalePackage: ModelPackage {
     public typealias Configuration = RealESRGANConfiguration
@@ -77,7 +78,24 @@ public final class RealESRGANUpscalePackage: ModelPackage {
         try Task.checkCancellation()
 
         let inPB = try Self.decodeToPixelBuffer(req.image)
-        let outPB = try await upscaler.upscale(inPB)
+        let inW = CVPixelBufferGetWidth(inPB), inH = CVPixelBufferGetHeight(inPB)
+        let native = upscaler.scaleFactor
+        let nativePB = try await upscaler.upscale(inPB)
+
+        // Honor a requested `scale` below the model's native factor by post-downsampling the
+        // native-Nx result to `inputDim * scale` (BRIDGE-029). `nil`, the native factor, or any
+        // request ≥ native pass through at native scale (the model can't exceed its native factor);
+        // `appliedScale` always reports what actually ran, so callers can verify.
+        let outPB: CVPixelBuffer
+        let appliedScale: Int
+        if let s = req.scale, s > 0, s < native {
+            outPB = try Self.resizePixelBuffer(nativePB, toWidth: inW * s, height: inH * s)
+            appliedScale = s
+        } else {
+            outPB = nativePB
+            appliedScale = native
+        }
+
         let w = CVPixelBufferGetWidth(outPB), h = CVPixelBufferGetHeight(outPB)
         // Output mirrors the input format: rawBGRA8 in ⇒ rawBGRA8 out (no re-encode); else .png.
         let outImage: Image
@@ -88,7 +106,7 @@ public final class RealESRGANUpscalePackage: ModelPackage {
             guard let png = Self.encodePNG(outPB) else { throw RealESRGANPackageError.imageEncodeFailed }
             outImage = Image(format: .png, data: png, width: w, height: h)
         }
-        return ImageUpscaleResponse(image: outImage, appliedScale: upscaler.scaleFactor)
+        return ImageUpscaleResponse(image: outImage, appliedScale: appliedScale)
     }
 
     // MARK: - Image codec
@@ -174,6 +192,44 @@ public final class RealESRGANUpscalePackage: ModelPackage {
                 memcpy(base.advanced(by: row * dstStride), srcBase.advanced(by: row * srcStride), rowBytes)
             }
         }
+        return buffer
+    }
+
+    /// High-quality downsample of a 32BGRA `CVPixelBuffer` to `w`×`h` (a new 32BGRA buffer).
+    /// Used to honor a requested `scale` below the model's native factor (BRIDGE-029).
+    nonisolated static func resizePixelBuffer(_ src: CVPixelBuffer, toWidth w: Int, height h: Int) throws -> CVPixelBuffer {
+        guard w > 0, h > 0 else {
+            throw RealESRGANPackageError.imageEncodeFailed
+        }
+        let ci = CIImage(cvPixelBuffer: src)
+        let ctx = CIContext(options: [.cacheIntermediates: false])
+        guard let cg = ctx.createCGImage(ci, from: ci.extent) else {
+            throw RealESRGANPackageError.imageEncodeFailed
+        }
+        var pb: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb) == kCVReturnSuccess,
+              let buffer = pb else {
+            throw RealESRGANPackageError.imageEncodeFailed
+        }
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer),
+              let outCtx = CGContext(
+                data: base, width: w, height: h, bitsPerComponent: 8,
+                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                    | CGBitmapInfo.byteOrder32Little.rawValue) else {
+            throw RealESRGANPackageError.imageEncodeFailed
+        }
+        outCtx.interpolationQuality = .high
+        outCtx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
         return buffer
     }
 
