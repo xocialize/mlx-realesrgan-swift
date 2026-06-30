@@ -14,6 +14,7 @@ let package = Package(
     products: [
         .library(name: "RealESRGANMLX", targets: ["RealESRGANMLX"]),
         .library(name: "MLXRealESRGAN", targets: ["MLXRealESRGAN"]),
+        .executable(name: "realesrgan-smoke", targets: ["RealESRGANSmoke"]),  // drive the package + measure split footprint
     ],
     dependencies: [
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.10.0"),
@@ -61,6 +62,20 @@ let package = Package(
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
                 .product(name: "MLXServeCore", package: "mlx-engine-swift"),
             ]
+        ),
+        // Drives RealESRGANUpscalePackage through the REAL MLXServeEngine (register → run) and reports
+        // the split footprint (resident floor / tiled activation peak) per the memory harness. Image op =
+        // fast, no GPU-watchdog risk. See EFFICIENCY-ADOPTION.md.
+        .executableTarget(
+            name: "RealESRGANSmoke",
+            dependencies: [
+                "MLXRealESRGAN",
+                .product(name: "MLX", package: "mlx-swift"),
+                .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLXServeCore", package: "mlx-engine-swift"),
+            ],
+            path: "Sources/Smoke",
+            swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]
 )

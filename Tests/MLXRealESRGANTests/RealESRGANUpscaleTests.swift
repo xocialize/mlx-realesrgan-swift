@@ -25,6 +25,21 @@ struct RealESRGANUpscaleTests {
         #expect(r.os.minMacOS == SemanticVersion(major: 26, minor: 0, patch: 0))
     }
 
+    /// Efficiency adoption (engine 1.14): the fp32 footprint declares the split (tiny resident weights
+    /// floor + the tile-bounded activation peak), so the engine reserves one shared transient.
+    @Test func splitFootprintDeclared() {
+        let fp = RealESRGANUpscalePackage.manifest.requirements.footprints.first { $0.quant == .fp32 }
+        #expect(fp?.peakActivationBytes ?? 0 > 0)                              // activation declared
+        // Tiled upscale: activation (tiles + 4× output) dwarfs the ~MB weights floor.
+        #expect((fp?.peakActivationBytes ?? 0) > (fp?.residentBytes ?? .max))
+    }
+
+    /// `QuantConfigured` so the governor charges the declared fp32 footprint, not largest-that-fits.
+    @Test func quantConfigured() {
+        let cfg: any PackageConfiguration = RealESRGANConfiguration(variant: .general)
+        #expect((cfg as? QuantConfigured)?.quant == .fp32)
+    }
+
     @Test func surfaceIsTheCanonicalUpscaleDescriptor() {
         let s = RealESRGANUpscalePackage.manifest.surfaces.first
         #expect(s?.capability == .imageUpscale)

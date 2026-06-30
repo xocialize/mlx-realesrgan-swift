@@ -29,3 +29,11 @@ public struct RealESRGANConfiguration: PackageConfiguration {
         self.variant = variant
     }
 }
+
+/// `QuantConfigured` (engine 1.14): all vendored SRVGGNetCompact checkpoints run at fp32 (the single
+/// declared footprint quant), so the governor charges the matching `QuantFootprint(.fp32, …)` rather
+/// than the largest-that-fits fallback. One quant today; the protocol keeps it honest if a quantized
+/// variant is added.
+extension RealESRGANConfiguration: QuantConfigured {
+    public var quant: Quant { .fp32 }
+}

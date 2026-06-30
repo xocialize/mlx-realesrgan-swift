@@ -35,8 +35,16 @@ public final class RealESRGANUpscalePackage: ModelPackage {
             provenance: Provenance(sourceRepo: "mlx-community/Real-ESRGAN-general-x4v3",
                                    revision: "main", tier: 1),
             requirements: RequirementsManifest(
-                // ~1-2 MB weights; the working set is the tiled activations + the 4× output.
-                footprints: [QuantFootprint(quant: .fp32, residentBytes: 1_000_000_000)],
+                // Split footprint (engine 1.14). Weights are ~1-2 MB; the working set is the **tiled**
+                // activations (64² tiles, feathered seams) + the 4× output buffer — so it's almost all
+                // transient, and tile-bounded (it does NOT scale with full input area). Re-measured via
+                // `realesrgan-smoke` through the real MLXServeEngine (see EFFICIENCY-ADOPTION.md):
+                //   512²→2048² peak 2170 MB · 1024²→4096² peak 1807 MB (lower — tile-bounded, output-driven),
+                //   floor ~3 MB in both → resident 32 MB / activation 2.2 GB (the 512² envelope worst case).
+                // residentBytes = weights floor (+ overhead); peakActivationBytes = tiled peak − floor. The
+                // engine reserves ONE shared transient across residents — the co-residency win for the
+                // optimizer chain. `QuantConfigured` (RealESRGANConfiguration) charges the fp32 footprint.
+                footprints: [QuantFootprint(quant: .fp32, residentBytes: 32_000_000, peakActivationBytes: 2_200_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: nil
