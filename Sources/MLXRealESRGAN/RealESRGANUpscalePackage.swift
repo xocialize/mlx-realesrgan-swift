@@ -39,13 +39,14 @@ public final class RealESRGANUpscalePackage: ModelPackage {
                 // Split footprint (engine 1.14). Weights are ~1-2 MB; the working set is the **tiled**
                 // activations (64² tiles, feathered seams) + the 4× output buffer — so it's almost all
                 // transient, and tile-bounded (it does NOT scale with full input area). Re-measured via
-                // `realesrgan-smoke` through the real MLXServeEngine (see EFFICIENCY-ADOPTION.md):
-                //   512²→2048² peak 2170 MB · 1024²→4096² peak 1807 MB (lower — tile-bounded, output-driven),
-                //   floor ~3 MB in both → resident 32 MB / activation 2.2 GB (the 512² envelope worst case).
-                // residentBytes = weights floor (+ overhead); peakActivationBytes = tiled peak − floor. The
-                // engine reserves ONE shared transient across residents — the co-residency win for the
-                // optimizer chain. `QuantConfigured` (RealESRGANConfiguration) charges the fp32 footprint.
-                footprints: [QuantFootprint(quant: .fp32, residentBytes: 32_000_000, peakActivationBytes: 2_200_000_000)],
+                // RE-BASELINED to in-app phys_footprint (MLXEngineImage, isolate+clearCache) — the
+                // admission-relevant basis the engine/R-MEM-1 compares against. The `realesrgan-smoke`
+                // MLX-peak (floor ~3 MB / act 2.2 GB) UNDER-read by ~2.7× (MLX buffer cache + process
+                // overhead it omits). Clean in-app: floor 1.02 GB · peak 6.26 GB · activation 5.24 GB
+                // (4× envelope). residentBytes = phys floor; peakActivationBytes = peak − floor. The engine
+                // reserves ONE shared transient across residents — the co-residency win for the optimizer
+                // chain. `QuantConfigured` (RealESRGANConfiguration) charges the fp32 footprint.
+                footprints: [QuantFootprint(quant: .fp32, residentBytes: 1_020_000_000, peakActivationBytes: 5_240_000_000)],
                 requiredBackends: [.metalGPU],
                 os: OSRequirement(minMacOS: SemanticVersion(major: 26, minor: 0, patch: 0)),
                 chipFloor: nil
