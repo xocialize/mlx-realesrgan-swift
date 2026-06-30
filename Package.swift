@@ -42,6 +42,7 @@ let package = Package(
             dependencies: [
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
                 "RealESRGANMLX",
+                .product(name: "MLX", package: "mlx-swift"),
             ],
             // The core's playback tier (MLX) isn't Sendable-audited; the engine serializes
             // lifecycle on InferenceActor, so v5 mode keeps region-isolation a warning.

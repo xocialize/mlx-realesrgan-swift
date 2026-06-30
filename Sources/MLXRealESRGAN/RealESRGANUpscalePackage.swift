@@ -4,6 +4,7 @@ import CoreImage
 import CoreVideo
 import ImageIO
 import UniformTypeIdentifiers
+import MLX
 import MLXToolKit
 import RealESRGANMLX
 
@@ -75,6 +76,7 @@ public final class RealESRGANUpscalePackage: ModelPackage {
 
     public func unload() async {
         upscaler = nil
+        MLX.Memory.clearCache()   // release the retained MLX pool so eviction frees RSS (not just drop refs)
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
