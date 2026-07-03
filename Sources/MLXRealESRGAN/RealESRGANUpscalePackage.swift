@@ -5,6 +5,7 @@ import CoreVideo
 import ImageIO
 import UniformTypeIdentifiers
 import MLX
+import MLXProfiling
 import MLXToolKit
 import RealESRGANMLX
 
@@ -91,7 +92,16 @@ public final class RealESRGANUpscalePackage: ModelPackage {
         let inPB = try Self.decodeToPixelBuffer(req.image)
         let inW = CVPixelBufferGetWidth(inPB), inH = CVPixelBufferGetHeight(inPB)
         let native = upscaler.scaleFactor
+
+        // Inference is profiled (MLX_PROFILE=1). The spans live in the core's tile driver — one
+        // per 64² tile (>1080p inputs) or one whole-frame span (≤1080p fast path); this layer just
+        // brackets them with the run header + summary. No-op when MLX_PROFILE is unset.
+        let prof = MLXProfiler.shared
+        prof.beginRun("realesrgan imageUpscale scale=\(req.scale ?? native) \(inW)x\(inH)")
         let nativePB = try await upscaler.upscale(inPB)
+        // ms/tile only when the core actually tiled; the whole-frame path records zero "tile" rows.
+        let tileCount = prof.recorded.count(where: { $0.group == "upscale" && $0.label == "tile" })
+        prof.endRun(denominators: ["tile": Double(tileCount)])
 
         // Honor a requested `scale` below the model's native factor by post-downsampling the
         // native-Nx result to `inputDim * scale` (BRIDGE-029). `nil`, the native factor, or any

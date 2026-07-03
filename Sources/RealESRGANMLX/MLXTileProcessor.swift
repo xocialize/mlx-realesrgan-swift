@@ -32,6 +32,7 @@ import CoreImage
 import CoreVideo
 import Foundation
 import MLX
+import MLXProfiling
 
 /// Tile driver for an MLX-Swift forward closure. The closure receives an
 /// `[1, H, W, 3]` NHWC RGB float32 tensor and returns an upscaled tensor
@@ -148,8 +149,15 @@ public struct MLXTileProcessor: @unchecked Sendable {
         // thrash the allocator for every tile of a 1080p frame.
         var tileScratch = [Float](repeating: 0, count: tileSize * tileSize * 3)
 
+        // Per-tile spans (MLX_PROFILE=1). `forward` evals inside each tile, so a span is the
+        // honest full tile cost (extract → forward/eval → readout → feather-blend). No-op when
+        // MLX_PROFILE is unset.
+        let prof = MLXProfiler.shared
+        var tileIndex = 0
+
         for tileY in stride(from: 0, to: height, by: step) {
             for tileX in stride(from: 0, to: width, by: step) {
+                let span = prof.begin("upscale", "tile", index: tileIndex)
                 // Clamp the tile origin so the last row/column stays inside the
                 // frame (matches TileProcessor's behaviour).
                 let x = min(tileX, max(0, width - tileSize))
@@ -197,6 +205,8 @@ public struct MLXTileProcessor: @unchecked Sendable {
                     outWidth: outWidth, outHeight: outHeight,
                     overlapScaled: overlap * scale
                 )
+                prof.end(span)
+                tileIndex += 1
             }
         }
 
@@ -266,6 +276,10 @@ public struct MLXTileProcessor: @unchecked Sendable {
         let srcBPR = CVPixelBufferGetBytesPerRow(input)
         let dstBPR = CVPixelBufferGetBytesPerRow(output)
 
+        // Single whole-frame span (MLX_PROFILE=1) — the untiled counterpart of the per-tile
+        // spans above: lift → forward/eval → readout. No-op when MLX_PROFILE is unset.
+        let span = MLXProfiler.shared.begin("upscale", "frame", note: "\(width)x\(height) whole-frame")
+
         // BGRA → NHWC RGB float32 [0, 1] for the whole frame.
         var scratch = [Float](repeating: 0, count: width * height * 3)
         scratch.withUnsafeMutableBufferPointer { buf in
@@ -321,6 +335,7 @@ public struct MLXTileProcessor: @unchecked Sendable {
                 }
             }
         }
+        MLXProfiler.shared.end(span)
 
         return output
     }

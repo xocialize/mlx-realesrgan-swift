@@ -18,6 +18,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.10.0"),
+        .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.30.0"),
     ],
     targets: [
@@ -28,6 +29,7 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
+                .product(name: "MLXProfiling", package: "mlx-profiling"),  // env-gated per-tile spans
             ],
             // Per-file .copy so the bundle layout is flat (forge ADR-0011).
             resources: [
@@ -41,6 +43,7 @@ let package = Package(
             name: "MLXRealESRGAN",
             dependencies: [
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
+                .product(name: "MLXProfiling", package: "mlx-profiling"),
                 "RealESRGANMLX",
                 .product(name: "MLX", package: "mlx-swift"),
             ],
