@@ -6,9 +6,11 @@ import PackageDescription
 //   • MLXRealESRGAN — the MLXEngine `imageUpscale` ModelPackage over that core
 // Consolidated 2026-06-18: the former standalone `realesrgan-mlx-swift` core was folded in here (and
 // archived). Vendored weights — no download. Python ref: xocialize/realesrgan-mlx.
-// Materialization posture (2026-07-09): BUNDLED-WEIGHTS package — ModelStorable + WeightPrewarming
-// over the bundle URLs (needsDownload reads false on fresh installs); WeightSourcing deliberately
-// NOT declared (no fresh-machine network source). See MLXRealESRGANTests/MaterializationTests.swift.
+// Materialization posture (engine ≥ 0.24.0, contract 1.17): BUNDLED-WEIGHTS package —
+// ModelStorable + BundledWeightSourcing (the MAT gate verifies the vendored checkpoint PRESENT on
+// a fresh machine; needsDownload reads false); WeightSourcing deliberately NOT declared (no
+// fresh-machine network source); WeightPrewarming = cold-start page-in only.
+// See MLXRealESRGANTests/MaterializationTests.swift.
 let package = Package(
     name: "mlx-realesrgan-swift",
     platforms: [
