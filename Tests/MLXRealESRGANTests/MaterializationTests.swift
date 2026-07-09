@@ -2,15 +2,13 @@
 //
 // This package is BUNDLED-WEIGHTS: every variant's checkpoint (~2 MB) is vendored in the core
 // bundle, so a fresh machine has the weights the moment the binary exists — there is nothing to
-// materialize. That maps onto the engine contract as:
-//   • MAT-1 (ModelStorable) — conformed; the engine can stamp its store root.
-//   • WeightPrewarming over the bundle URLs — always-present paths, so `needsDownload` reads
-//     false on a fresh install (the store-marker heuristic would otherwise read "needs
-//     download" forever for a package that never downloads).
-//   • MAT-2..5 (WeightSourcing) — deliberately NOT declared: there is no fresh-machine network
-//     source, and a declared source would either report a dishonest missing set (MAT-4) or
-//     force a pointless download of weights already in the binary. The MAT gate lacks
-//     bundled-weights vocabulary today; when the engine grows it, revisit.
+// materialize. Since engine 0.24.0 (contract 1.17) that posture is first-class MAT vocabulary:
+//   • MAT-1 (ModelStorable) — the engine can stamp its store root.
+//   • MAT-2..4 (BundledWeightSourcing) — the selected variant's checkpoint is declared as a
+//     bundled source; the gate verifies it PRESENT on a fresh machine (the inverse of
+//     WeightSourcing's required-missing network rule), and `needsDownload` reads false.
+//   • WeightSourcing stays undeclared by design: there is no fresh-machine network source.
+//   • WeightPrewarming keeps its own job — cold-start page-in of the checkpoint before load().
 
 import Foundation
 import MLXServeConformance
@@ -21,15 +19,15 @@ import XCTest
 
 final class MaterializationTests: XCTestCase {
 
-    /// MAT-1: the engine can stamp the store root. (The full report is expected NOT to pass —
-    /// MAT-2 requires a WeightSourcing declaration this bundled package deliberately omits.)
-    func testMAT1ModelStorable() {
-        let report = MaterializationConformance.check(
-            freshConfiguration: RealESRGANConfiguration())
-        guard let mat1 = report.checks.first(where: { $0.name.hasPrefix("MAT-1") }) else {
-            return XCTFail("no MAT-1 check in report:\n\(report.summary)")
+    /// The FULL MAT gate passes per selectable variant (contract 1.17 bundled vocabulary):
+    /// MAT-1 store-stampable, MAT-2 bundled source declared, MAT-3 hygiene, MAT-4 the vendored
+    /// checkpoint verified PRESENT on a fresh configuration.
+    func testFullMATGatePassesPerVariant() {
+        for variant in RealESRGANVariant.allCases {
+            let report = MaterializationConformance.check(
+                freshConfiguration: RealESRGANConfiguration(variant: variant))
+            XCTAssertTrue(report.passed, "\(variant):\n\(report.summary)")
         }
-        XCTAssertTrue(mat1.passed, mat1.note)
     }
 
     /// Every selectable variant's checkpoint is actually IN the built bundle — the invariant the

@@ -20,7 +20,7 @@ let package = Package(
         .executable(name: "realesrgan-smoke", targets: ["RealESRGANSmoke"]),  // drive the package + measure split footprint
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.23.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.24.0"),
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.30.0"),
     ],

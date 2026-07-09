@@ -24,13 +24,13 @@ public enum RealESRGANVariant: String, Codable, Sendable, CaseIterable {
 /// the core package bundle** — the weights (~2 MB each) ship with the code, so a fresh machine
 /// never downloads anything and `load()` never touches the network.
 ///
-/// Materialization posture (engine ≥ 0.19.0): `ModelStorable` so the engine can stamp its store
-/// root (MAT-1), and `WeightPrewarming` over the bundle URLs — always-present prewarm paths are
-/// the engine's sanctioned signal that a bundled package is ready, so `needsDownload` reads
-/// `false` on a fresh install instead of waiting forever for a store marker. `WeightSourcing`
-/// is deliberately NOT declared: there is no fresh-machine network source, and declaring one
-/// would either lie about the missing set (MAT-4) or force a download of weights already in the
-/// binary. (The MAT gate has no bundled-weights vocabulary yet — engine-side gap, filed.)
+/// Materialization posture (engine ≥ 0.24.0, contract 1.17): `ModelStorable` so the engine can
+/// stamp its store root (MAT-1), and `BundledWeightSourcing` declaring the selected variant's
+/// checkpoint as a bundled source — the MAT gate verifies it PRESENT on a fresh machine and
+/// `needsDownload` reads `false` on a fresh install. `WeightSourcing` stays undeclared by
+/// design: there is no fresh-machine network source, and declaring one would either lie about
+/// the missing set (MAT-4) or force a download of weights already in the binary.
+/// `WeightPrewarming` remains for its own job: paging the checkpoint in before `load()`.
 public struct RealESRGANConfiguration: PackageConfiguration, ModelStorable {
     public var variant: RealESRGANVariant
     /// Engine-chosen models root. Stamped by the engine from its `ModelStore`; unused today
@@ -48,9 +48,16 @@ public struct RealESRGANConfiguration: PackageConfiguration, ModelStorable {
     }
 }
 
-/// Bundled weights read as permanently prewarm-able: the paths always exist, so the engine's
-/// `needsDownload` heuristic short-circuits to `false` (nothing to fetch) and the prewarmer
-/// pages the ~2 MB checkpoint before first load.
+/// The bundled-weights declaration (contract 1.17): the selected variant's vendored checkpoint,
+/// verified PRESENT by the MAT gate (a stripped resource fails the package suite, not the user's
+/// first upscale) and read by the engine's `needsDownload` as "nothing to fetch".
+extension RealESRGANConfiguration: BundledWeightSourcing {
+    public var bundledWeightSources: [BundledWeightSource] {
+        [BundledWeightSource(role: "checkpoint", url: variant.coreVariant.bundledWeightsURL)]
+    }
+}
+
+/// Cold-start page-in: the prewarmer pages the ~2 MB checkpoint before first load.
 extension RealESRGANConfiguration: WeightPrewarming {
     public var prewarmPaths: [URL] {
         [variant.coreVariant.bundledWeightsURL].compactMap { $0 }
