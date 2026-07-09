@@ -82,12 +82,15 @@ public final class RealESRGANUpscalePackage: ModelPackage {
     }
 
     public func run(_ request: any CapabilityRequest) async throws -> any CapabilityResponse {
+        // CAN-1: the entry checkpoint is the FIRST act of run() — before notLoaded validation
+        // (engine ≥ 0.27.0). Mid-run cadence: the core's tile driver checkpoints once per 64²
+        // tile (MLXTileProcessor.process), rethrown unchanged through upscale().
+        try Task.checkCancellation()
         guard let upscaler else { throw PackageError.notLoaded }
         guard request.capability == .imageUpscale,
               let req = request as? ImageUpscaleRequest else {
             throw PackageError.unsupportedCapability(request.capability)
         }
-        try Task.checkCancellation()
 
         let inPB = try Self.decodeToPixelBuffer(req.image)
         let inW = CVPixelBufferGetWidth(inPB), inH = CVPixelBufferGetHeight(inPB)

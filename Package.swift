@@ -11,6 +11,8 @@ import PackageDescription
 // a fresh machine; needsDownload reads false); WeightSourcing deliberately NOT declared (no
 // fresh-machine network source); WeightPrewarming = cold-start page-in only.
 // See MLXRealESRGANTests/MaterializationTests.swift.
+// Cancellation posture (engine ≥ 0.27.0, CAN gate): entry checkpoint first act of run(); the
+// core's tile driver checkpoints once per 64² tile. See MLXRealESRGANTests/CancellationTests.swift.
 let package = Package(
     name: "mlx-realesrgan-swift",
     platforms: [
@@ -22,7 +24,7 @@ let package = Package(
         .executable(name: "realesrgan-smoke", targets: ["RealESRGANSmoke"]),  // drive the package + measure split footprint
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.24.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.30.0"),
     ],

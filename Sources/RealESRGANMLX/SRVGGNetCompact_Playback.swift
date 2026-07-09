@@ -148,6 +148,10 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
             }
         } catch let err as PlaybackTierError {
             throw err
+        } catch is CancellationError {
+            // CAN-2: never launder a cancellation — the per-tile checkpoint's
+            // CancellationError must reach the engine unchanged.
+            throw CancellationError()
         } catch {
             throw PlaybackTierError.inferenceError(String(describing: error))
         }

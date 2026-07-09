@@ -157,6 +157,10 @@ public struct MLXTileProcessor: @unchecked Sendable {
 
         for tileY in stride(from: 0, to: height, by: step) {
             for tileX in stride(from: 0, to: width, by: step) {
+                // Cooperative cancellation (CAN gate): one checkpoint per 64² tile — the
+                // natural yield point of the tiled forward. Sync code on the run's task sees
+                // the flag; the CancellationError propagates unchanged to the wrapper.
+                try Task.checkCancellation()
                 let span = prof.begin("upscale", "tile", index: tileIndex)
                 // Clamp the tile origin so the last row/column stays inside the
                 // frame (matches TileProcessor's behaviour).
