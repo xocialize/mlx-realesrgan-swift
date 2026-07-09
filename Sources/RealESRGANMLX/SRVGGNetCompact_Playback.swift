@@ -46,6 +46,13 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
             }
         }
 
+        /// The vendored checkpoint's on-disk URL inside the package bundle. Present in every
+        /// correct build product (the weights ship with the code — no download, ever); `nil`
+        /// only if the resource was stripped from the bundle.
+        public var bundledWeightsURL: URL? {
+            Bundle.module.url(forResource: safetensorsName, withExtension: "safetensors")
+        }
+
         /// Stable `PlaybackTier.name` identifier per variant.
         var tierName: String {
             switch self {

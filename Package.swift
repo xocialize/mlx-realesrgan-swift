@@ -6,6 +6,9 @@ import PackageDescription
 //   • MLXRealESRGAN — the MLXEngine `imageUpscale` ModelPackage over that core
 // Consolidated 2026-06-18: the former standalone `realesrgan-mlx-swift` core was folded in here (and
 // archived). Vendored weights — no download. Python ref: xocialize/realesrgan-mlx.
+// Materialization posture (2026-07-09): BUNDLED-WEIGHTS package — ModelStorable + WeightPrewarming
+// over the bundle URLs (needsDownload reads false on fresh installs); WeightSourcing deliberately
+// NOT declared (no fresh-machine network source). See MLXRealESRGANTests/MaterializationTests.swift.
 let package = Package(
     name: "mlx-realesrgan-swift",
     platforms: [
@@ -17,7 +20,7 @@ let package = Package(
         .executable(name: "realesrgan-smoke", targets: ["RealESRGANSmoke"]),  // drive the package + measure split footprint
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.10.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.23.0"),
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.30.0"),
     ],
@@ -65,6 +68,7 @@ let package = Package(
                 "MLXRealESRGAN",
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
                 .product(name: "MLXServeCore", package: "mlx-engine-swift"),
+                .product(name: "MLXServeConformance", package: "mlx-engine-swift"),
             ]
         ),
         // Drives RealESRGANUpscalePackage through the REAL MLXServeEngine (register → run) and reports
