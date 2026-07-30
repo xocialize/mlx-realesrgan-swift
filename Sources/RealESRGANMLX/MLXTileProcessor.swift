@@ -229,7 +229,16 @@ public struct MLXTileProcessor: @unchecked Sendable {
         let prof = MLXProfiler.shared
         var tileIndex = 0
 
+        // Feathered composite accumulator. Tiles arrive in raster order, so only the rows one
+        // tile row can still touch stay open — `tileSize·scale` of them. See `SeamAccumulator`
+        // for why the old in-place 8-bit blend was replaced.
+        var accum = SeamAccumulator(outWidth: outWidth, outHeight: outHeight,
+                                    rows: tileSize * scale)
+
         for tileY in stride(from: 0, to: height, by: step) {
+            // Every output row above this tile row's first row is final: flush and slide.
+            accum.flush(upTo: min(tileY, max(0, height - tileSize)) * scale,
+                        dst: dstPtr, dstBPR: dstBPR)
             for tileX in stride(from: 0, to: width, by: step) {
                 // Cooperative cancellation (CAN gate): one checkpoint per 64² tile — the
                 // natural yield point of the tiled forward. Sync code on the run's task sees
@@ -292,20 +301,18 @@ public struct MLXTileProcessor: @unchecked Sendable {
                 let outW = shape[2]
                 let outFloats = upscaled.asArray(Float.self)
 
-                writeTile(
+                accum.add(
                     outFloats: outFloats,
                     outH: outH, outW: outW,
-                    dst: dstPtr,
-                    dstBPR: dstBPR,
                     x: x * scale, y: y * scale,
                     tw: tw * scale, th: th * scale,
-                    outWidth: outWidth, outHeight: outHeight,
                     overlapScaled: overlap * scale
                 )
                 prof.end(span)
                 tileIndex += 1
             }
         }
+        accum.flush(upTo: outHeight, dst: dstPtr, dstBPR: dstBPR)
 
         return output
     }
@@ -425,9 +432,13 @@ public struct MLXTileProcessor: @unchecked Sendable {
                     let g = max(0, min(1, base[s + 1]))
                     let b = max(0, min(1, base[s + 2]))
                     let d = dstRow + xx * 4
-                    dstPtr[d + 0] = UInt8(b * 255)
-                    dstPtr[d + 1] = UInt8(g * 255)
-                    dstPtr[d + 2] = UInt8(r * 255)
+                    // ROUND, not truncate — `UInt8(_:)` discards the fraction, which is a
+                    // systematic −0.5 LSB darkening across the whole frame. This path is the
+                    // reference arm the tiled path is measured against, so the two must
+                    // quantise the same way (WORKORDER-tile-compositor).
+                    dstPtr[d + 0] = UInt8((b * 255).rounded())
+                    dstPtr[d + 1] = UInt8((g * 255).rounded())
+                    dstPtr[d + 2] = UInt8((r * 255).rounded())
                     dstPtr[d + 3] = 255
                 }
             }
@@ -496,71 +507,160 @@ public struct MLXTileProcessor: @unchecked Sendable {
     }
 
     // MARK: - Tile write with feathered overlap blending
+}
 
-    /// Write the upscaled tile (NHWC RGB float32, contiguous) into the
-    /// destination BGRA buffer with the same feathered blend
-    /// `TileProcessor.writeTile` uses.
+/// Float32 accumulator for the feathered tile composite.
+///
+/// 🚨 **Why this replaced the previous in-place 8-bit blend** (`existing·(1−w) + new·w`
+/// written straight into the destination BGRA buffer, WORKORDER-tile-compositor, measured
+/// 2026-07-30). That writer had three defects, all of which put error on the
+/// `tileSize − overlap` grid — i.e. exactly the tiled-refine "seam lattice":
+///
+///  1. **It was not a normalised weighted average.** Over-compositing tile-by-tile with only
+///     the *new* tile's weight is order-dependent. Along a 1-D seam two complementary ramps
+///     happen to agree, but where **four tiles meet** the weight is a product of two ramps and
+///     the first-written tile keeps far too much: measured effective weights at the corner
+///     were `[0.31 0.01 0.23 0.44]` where the normalised average is `[0.05 0.05 0.44 0.47]`
+///     — up to **0.267 absolute weight error**, on a lattice at the write stride.
+///  2. **It quantised on every write.** Overlap pixels were stamped, read back as `UInt8`,
+///     blended and truncated again (`UInt8(_:)` discards the fraction, it does not round), so
+///     the overlap bands carried a systematic downward bias the tile interiors did not:
+///     6412 pixels of a 2048² identity forward came out **−1, every one of them negative**,
+///     concentrated in the 32 px bands on the 224 grid.
+///  3. **It used the destination alpha byte as an "untouched" flag.** `CVPixelBufferCreate`
+///     recycles memory — measured 23 of 24 fresh 2048² allocations came back with alpha 255
+///     everywhere — so from the second frame onward the first write into a feathered pixel
+///     blended against **the previous frame's content** instead of stamping. An identity
+///     forward on the second run differed from its input in **28% of pixels, max |Δ| 250**.
+///
+/// The fix is the textbook composite: accumulate `Σ(wᵢ·xᵢ)` and `Σ(wᵢ)` in float32, divide
+/// once, quantise once **with rounding**. Order-independent, corner-correct, and it never
+/// reads the destination buffer, so recycled memory cannot leak in.
+///
+/// **Bounded memory.** Tiles arrive in raster order, so only the output rows a tile row can
+/// still touch need to stay open: the band is `tileSize · scale` rows, flushed and slid
+/// forward as the tile rows advance. That is 63 MB for the Real-ESRGAN 4K ×4 worst case
+/// (64 px tiles, 15360 px wide) and 8 MB for the SeedVR2 2048² refine — not proportional to
+/// the frame.
+private struct SeamAccumulator {
+    let outWidth: Int
+    let outHeight: Int
+    let rows: Int
+
+    /// First output row currently held in the band.
+    private var y0 = 0
+    /// `rows × outWidth × 3` premultiplied colour, and `rows × outWidth` weight.
+    private var colour: [Float]
+    private var weight: [Float]
+
+    init(outWidth: Int, outHeight: Int, rows: Int) {
+        self.outWidth = outWidth
+        self.outHeight = outHeight
+        self.rows = max(1, min(rows, outHeight))
+        self.colour = [Float](repeating: 0, count: self.rows * outWidth * 3)
+        self.weight = [Float](repeating: 0, count: self.rows * outWidth)
+    }
+
+    /// Feather profile for one axis, **half-pixel centred** so it is strictly positive and the
+    /// two ramps across a seam sum to exactly 1.
+    ///
+    /// The previous `tx / ov` form hit exactly 0 on a tile's own border, which made the 2-D
+    /// product weight 0 for *every* tile covering an image-edge pixel (0/0 under
+    /// normalisation) and made the pair of ramps across a seam sum to `(ov−1)/ov` rather than
+    /// 1 — a residual the weight probe measured as 0.029 even on the well-behaved 1-D seam.
     @inline(__always)
-    private func writeTile(
+    private static func ramp(_ i: Int, _ extent: Int, _ ov: Int) -> Float {
+        let lo = (Float(i) + 0.5) / Float(ov)
+        let hi = (Float(extent - 1 - i) + 0.5) / Float(ov)
+        return min(min(lo, 1.0), min(hi, 1.0))
+    }
+
+    /// Add one upscaled tile (NHWC RGB float32, contiguous) to the band.
+    ///
+    /// - Precondition: `flush(upTo: y)` has already run, so `y >= y0`, and the tile fits the
+    ///   band (`th <= rows`). Both hold for raster-order tiles with `rows == tileSize·scale`.
+    mutating func add(
         outFloats: [Float],
         outH: Int, outW: Int,
-        dst: UnsafeMutablePointer<UInt8>,
-        dstBPR: Int,
         x: Int, y: Int, tw: Int, th: Int,
-        outWidth: Int, outHeight: Int,
         overlapScaled: Int
     ) {
         let ov = max(overlapScaled, 1)
         let writeH = min(outH, th)
         let writeW = min(outW, tw)
+        let bandY0 = y0
 
-        outFloats.withUnsafeBufferPointer { buf in
-            let base = buf.baseAddress!
-            for ty in 0 ..< writeH {
-                let dstY = y + ty
-                guard dstY < outHeight else { continue }
-                for tx in 0 ..< writeW {
-                    let dstX = x + tx
-                    guard dstX < outWidth else { continue }
-                    let srcOff = (ty * outW + tx) * 3
-                    let r = max(0, min(1, base[srcOff + 0]))
-                    let g = max(0, min(1, base[srcOff + 1]))
-                    let b = max(0, min(1, base[srcOff + 2]))
-
-                    // Feather weight: 1.0 in centre, ramps to 0 at edges.
-                    let wxLeft  = min(Float(tx) / Float(ov), 1.0)
-                    let wxRight = min(Float(outW - 1 - tx) / Float(ov), 1.0)
-                    let wyTop   = min(Float(ty) / Float(ov), 1.0)
-                    let wyBot   = min(Float(outH - 1 - ty) / Float(ov), 1.0)
-                    let weight  = min(wxLeft, wxRight) * min(wyTop, wyBot)
-
-                    let dstOff = dstY * dstBPR + dstX * 4
-                    if weight >= 0.999 {
-                        dst[dstOff + 0] = UInt8(b * 255)
-                        dst[dstOff + 1] = UInt8(g * 255)
-                        dst[dstOff + 2] = UInt8(r * 255)
-                        dst[dstOff + 3] = 255
-                    } else if dst[dstOff + 3] == 0 {
-                        // First write into this pixel — feather hasn't been
-                        // applied yet, just stamp.
-                        dst[dstOff + 0] = UInt8(b * 255)
-                        dst[dstOff + 1] = UInt8(g * 255)
-                        dst[dstOff + 2] = UInt8(r * 255)
-                        dst[dstOff + 3] = 255
-                    } else {
-                        let existB = Float(dst[dstOff + 0]) / 255.0
-                        let existG = Float(dst[dstOff + 1]) / 255.0
-                        let existR = Float(dst[dstOff + 2]) / 255.0
-                        let blendR = existR * (1.0 - weight) + r * weight
-                        let blendG = existG * (1.0 - weight) + g * weight
-                        let blendB = existB * (1.0 - weight) + b * weight
-                        dst[dstOff + 0] = UInt8(max(0, min(255, blendB * 255)))
-                        dst[dstOff + 1] = UInt8(max(0, min(255, blendG * 255)))
-                        dst[dstOff + 2] = UInt8(max(0, min(255, blendR * 255)))
-                        dst[dstOff + 3] = 255
+        outFloats.withUnsafeBufferPointer { src in
+            colour.withUnsafeMutableBufferPointer { col in
+                weight.withUnsafeMutableBufferPointer { wgt in
+                    let s = src.baseAddress!, c = col.baseAddress!, w = wgt.baseAddress!
+                    for ty in 0 ..< writeH {
+                        let dstY = y + ty
+                        guard dstY < outHeight else { continue }
+                        let row = dstY - bandY0
+                        guard row >= 0, row < rows else { continue }
+                        let wy = Self.ramp(ty, outH, ov)
+                        for tx in 0 ..< writeW {
+                            let dstX = x + tx
+                            guard dstX < outWidth else { continue }
+                            let sOff = (ty * outW + tx) * 3
+                            let r = max(0, min(1, s[sOff + 0]))
+                            let g = max(0, min(1, s[sOff + 1]))
+                            let b = max(0, min(1, s[sOff + 2]))
+                            let wt = Self.ramp(tx, outW, ov) * wy
+                            let p = row * outWidth + dstX
+                            c[p * 3 + 0] += r * wt
+                            c[p * 3 + 1] += g * wt
+                            c[p * 3 + 2] += b * wt
+                            w[p] += wt
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Resolve and write every band row below `yEnd` into the destination, then slide the band
+    /// so it starts at `yEnd`. Rows no tile ever covered are written as opaque black rather
+    /// than left alone — the destination buffer's prior contents are never a valid answer.
+    mutating func flush(upTo yEnd: Int, dst: UnsafeMutablePointer<UInt8>, dstBPR: Int) {
+        let end = min(yEnd, outHeight)
+        guard end > y0 else { return }
+        let n = end - y0
+
+        colour.withUnsafeMutableBufferPointer { col in
+            weight.withUnsafeMutableBufferPointer { wgt in
+                let c = col.baseAddress!, w = wgt.baseAddress!
+                for row in 0 ..< min(n, rows) {
+                    let dstRow = (y0 + row) * dstBPR
+                    for x in 0 ..< outWidth {
+                        let p = row * outWidth + x
+                        let sw = w[p]
+                        let d = dstRow + x * 4
+                        if sw > 0 {
+                            let inv = 1.0 / sw
+                            // Divide once, quantise once, ROUND — truncating here is what put a
+                            // one-sided −1 LSB bias in the overlap bands.
+                            let r = (max(0, min(1, c[p * 3 + 0] * inv)) * 255).rounded()
+                            let g = (max(0, min(1, c[p * 3 + 1] * inv)) * 255).rounded()
+                            let b = (max(0, min(1, c[p * 3 + 2] * inv)) * 255).rounded()
+                            dst[d + 0] = UInt8(b); dst[d + 1] = UInt8(g); dst[d + 2] = UInt8(r)
+                        } else {
+                            dst[d + 0] = 0; dst[d + 1] = 0; dst[d + 2] = 0
+                        }
+                        dst[d + 3] = 255
+                    }
+                }
+                // Slide: keep the still-open rows, zero what they vacate.
+                let keep = rows - min(n, rows)
+                if keep > 0 {
+                    memmove(c, c + n * outWidth * 3, keep * outWidth * 3 * MemoryLayout<Float>.size)
+                    memmove(w, w + n * outWidth, keep * outWidth * MemoryLayout<Float>.size)
+                }
+                memset(c + keep * outWidth * 3, 0, (rows - keep) * outWidth * 3 * MemoryLayout<Float>.size)
+                memset(w + keep * outWidth, 0, (rows - keep) * outWidth * MemoryLayout<Float>.size)
+            }
+        }
+        y0 = end
     }
 }
