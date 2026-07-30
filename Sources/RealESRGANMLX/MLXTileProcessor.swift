@@ -48,6 +48,23 @@ public struct TileRegion: Sendable {
     public let y: Int
     public let width: Int
     public let height: Int
+    /// Margin of **real surrounding image content** included on every side of the tensor handed to the
+    /// closure (`0` for the plain overloads). With a halo the tensor is `(tileSize + 2·halo)²` and its
+    /// top-left corner sits at `(x - halo, y - halo)` in input-pixel space; the driver crops the halo
+    /// off the closure's output before blending, so the closure never has to.
+    ///
+    /// 🔑 **Index whole-image fields at `x`/`y`, not at `x - halo`** — a field drawn over the image
+    /// *padded by `halo` on every side* is indexed by the unpadded origin, which keeps the arithmetic
+    /// non-negative and identical between neighbours. (The SeedVR2 tiled-refine noise field does this.)
+    public let halo: Int
+
+    public init(x: Int, y: Int, width: Int, height: Int, halo: Int = 0) {
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+        self.halo = halo
+    }
 }
 
 /// Tile driver for an MLX-Swift forward closure. The closure receives an
@@ -132,6 +149,33 @@ public struct MLXTileProcessor: @unchecked Sendable {
         _ rawInput: CVPixelBuffer,
         forward: (MLXArray, TileRegion) throws -> MLXArray
     ) throws -> CVPixelBuffer {
+        try process(rawInput, halo: 0, forward: forward)
+    }
+
+    /// **Halo (context-padding) variant.** Each tile is handed a `(tileSize + 2·halo)²` window whose
+    /// margin is *real neighbouring image content* (edge-replicated only where the window leaves the
+    /// frame); the driver crops that margin off the closure's output and feather-blends the `tileSize²`
+    /// centre exactly as the plain overloads do.
+    ///
+    /// 🔑 **Why this is not the same lever as `overlap`.** Overlap blends two outputs that were
+    /// produced from different context and therefore already disagree; a halo makes them agree in the
+    /// first place, because each tile's receptive field actually contains its neighbourhood instead of a
+    /// replicated border. For a fully-convolutional network with no downsampling the two are nearly
+    /// equivalent, and this overload buys nothing — it exists for backends whose per-tile output depends
+    /// on the whole window (windowed attention, diffusion), where a border is not a neighbourhood.
+    ///
+    /// ⚠️ **Not free:** at `tileSize` 256 a 64 px halo processes 384², i.e. **2.25× the pixels per
+    /// tile**. `halo: 0` delegates to the plain path and is byte-identical to it.
+    ///
+    /// - Parameter halo: context margin in **input** pixels, `>= 0`. Backends with alignment
+    ///   constraints (e.g. a `/16` window/patch scheme) must choose a `halo` that keeps
+    ///   `tileSize + 2·halo` aligned — the driver does not round it.
+    public func process(
+        _ rawInput: CVPixelBuffer,
+        halo: Int,
+        forward: (MLXArray, TileRegion) throws -> MLXArray
+    ) throws -> CVPixelBuffer {
+        precondition(halo >= 0, "halo must be non-negative, got \(halo)")
         let input = normalizedBGRA(rawInput)
         let width = CVPixelBufferGetWidth(input)
         let height = CVPixelBufferGetHeight(input)
@@ -174,8 +218,10 @@ public struct MLXTileProcessor: @unchecked Sendable {
         let dstBPR = CVPixelBufferGetBytesPerRow(output)
 
         // Pre-allocate the per-tile float32 scratch buffer so we don't
-        // thrash the allocator for every tile of a 1080p frame.
-        var tileScratch = [Float](repeating: 0, count: tileSize * tileSize * 3)
+        // thrash the allocator for every tile of a 1080p frame. With a halo the
+        // window handed to the closure is `(tileSize + 2·halo)²`.
+        let windowSize = tileSize + 2 * halo
+        var tileScratch = [Float](repeating: 0, count: windowSize * windowSize * 3)
 
         // Per-tile spans (MLX_PROFILE=1). `forward` evals inside each tile, so a span is the
         // honest full tile cost (extract → forward/eval → readout → feather-blend). No-op when
@@ -197,31 +243,50 @@ public struct MLXTileProcessor: @unchecked Sendable {
                 let tw = min(tileSize, width - x)
                 let th = min(tileSize, height - y)
 
-                // Extract BGRA → NHWC RGB float32 [0, 1] into the scratch
-                // buffer, padding any out-of-clamp region with the nearest
-                // valid pixel (same approach as TileProcessor).
-                fillTileScratch(
+                // Extract BGRA → NHWC RGB float32 [0, 1] into the scratch buffer. The window
+                // is the tile plus its halo margin; any part of the window outside the FRAME
+                // clamps to the nearest valid pixel (edge replication, same approach as
+                // TileProcessor) — but inside the frame the halo reads REAL neighbouring
+                // pixels, which is the entire point of context padding.
+                fillWindowScratch(
                     src: srcPtr,
                     srcBPR: srcBPR,
-                    x: x, y: y, tw: tw, th: th,
+                    windowX: x - halo, windowY: y - halo, windowSize: windowSize,
+                    frameW: width, frameH: height,
                     scratch: &tileScratch
                 )
 
-                // Wrap scratch as `[1, tileSize, tileSize, 3]` NHWC.
-                let tileArray = MLXArray(tileScratch, [1, tileSize, tileSize, 3])
-                let upscaled = try forward(tileArray, TileRegion(x: x, y: y, width: tw, height: th))
+                // Wrap scratch as `[1, windowSize, windowSize, 3]` NHWC.
+                let tileArray = MLXArray(tileScratch, [1, windowSize, windowSize, 3])
+                var upscaled = try forward(tileArray, TileRegion(x: x, y: y, width: tw, height: th,
+                                                                 halo: halo))
                 // `forward` is contractually expected to MLX.eval before
                 // returning; we re-eval defensively so a stray lazy graph
                 // can't silently zero the read-out.
                 MLX.eval(upscaled)
 
-                let shape = upscaled.shape
+                var shape = upscaled.shape
                 guard shape.count == 4,
                       shape[0] == 1,
                       shape[3] == 3 else {
                     throw PlaybackTierError.inferenceError(
                         "unexpected forward output shape \(shape); want [1, H, W, 3]"
                     )
+                }
+                if halo > 0 {
+                    // Crop the halo off the output so only the tile's own centre is blended.
+                    // The margin exists to give the forward context, never to be written out.
+                    let hs = halo * scale
+                    let core = tileSize * scale
+                    guard shape[1] >= core + 2 * hs, shape[2] >= core + 2 * hs else {
+                        throw PlaybackTierError.inferenceError(
+                            "halo forward output \(shape) smaller than window "
+                            + "\((core + 2 * hs))² — closure must process the full window"
+                        )
+                    }
+                    upscaled = upscaled[0..., hs ..< (hs + core), hs ..< (hs + core), 0...]
+                    MLX.eval(upscaled)
+                    shape = upscaled.shape
                 }
                 let outH = shape[1]
                 let outW = shape[2]
@@ -394,31 +459,34 @@ public struct MLXTileProcessor: @unchecked Sendable {
 
     // MARK: - Tile extraction (BGRA → NHWC RGB float32)
 
-    /// Fill `scratch` with the `tileSize × tileSize × 3` RGB float32 view of
-    /// the BGRA source region starting at `(x, y)`. Pixels outside `(x..x+tw,
-    /// y..y+th)` clamp to the last valid pixel — matches `TileProcessor`'s
-    /// edge-extension behaviour so a tile that overhangs the frame edge
-    /// doesn't produce a hard cut.
+    /// Fill `scratch` with the `windowSize × windowSize × 3` RGB float32 view of the BGRA source
+    /// window starting at `(windowX, windowY)` — which may be negative or overhang the frame when a
+    /// halo is in play. Pixels outside the FRAME clamp to the nearest valid pixel (matches
+    /// `TileProcessor`'s edge-extension behaviour so an overhang doesn't produce a hard cut); pixels
+    /// inside the frame are always read as-is, so a halo margin carries real neighbouring content.
+    /// With `halo == 0` this reduces exactly to the old per-tile extraction (the clamp then only ever
+    /// fires where the old tile-region clamp fired: a frame smaller than the tile).
     @inline(__always)
-    private func fillTileScratch(
+    private func fillWindowScratch(
         src: UnsafePointer<UInt8>,
         srcBPR: Int,
-        x: Int, y: Int, tw: Int, th: Int,
+        windowX: Int, windowY: Int, windowSize: Int,
+        frameW: Int, frameH: Int,
         scratch: inout [Float]
     ) {
         scratch.withUnsafeMutableBufferPointer { buf in
             let base = buf.baseAddress!
             let scale = Float(1.0 / 255.0)
-            for ty in 0 ..< tileSize {
-                let srcY = min(y + ty, y + th - 1)
-                for tx in 0 ..< tileSize {
-                    let srcX = min(x + tx, x + tw - 1)
+            for ty in 0 ..< windowSize {
+                let srcY = min(max(windowY + ty, 0), frameH - 1)
+                for tx in 0 ..< windowSize {
+                    let srcX = min(max(windowX + tx, 0), frameW - 1)
                     let off = srcY * srcBPR + srcX * 4
                     // BGRA → RGB.
                     let b = Float(src[off + 0]) * scale
                     let g = Float(src[off + 1]) * scale
                     let r = Float(src[off + 2]) * scale
-                    let dstOff = (ty * tileSize + tx) * 3
+                    let dstOff = (ty * windowSize + tx) * 3
                     base[dstOff + 0] = r
                     base[dstOff + 1] = g
                     base[dstOff + 2] = b
