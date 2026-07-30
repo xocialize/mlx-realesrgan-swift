@@ -34,6 +34,22 @@ import Foundation
 import MLX
 import MLXProfiling
 
+/// Where a tile sits in the *input* frame, in input-pixel space.
+///
+/// Handed to the region-aware `process(_:forward:)` closure so per-tile work that
+/// needs global context — e.g. slicing a whole-image noise field so it stays
+/// continuous across seams (the SeedVR2 tiled-refine case) — knows which region
+/// the tile covers. `x`/`y` are the clamped tile origin; `width`/`height` are the
+/// in-frame extent (≤ `tileSize` only at a right/bottom edge). The tensor the
+/// closure receives is always `tileSize × tileSize` — pixels beyond
+/// `width`/`height` are edge-replicated padding.
+public struct TileRegion: Sendable {
+    public let x: Int
+    public let y: Int
+    public let width: Int
+    public let height: Int
+}
+
 /// Tile driver for an MLX-Swift forward closure. The closure receives an
 /// `[1, H, W, 3]` NHWC RGB float32 tensor and returns an upscaled tensor
 /// `[1, H*scale, W*scale, 3]`. The driver handles CVPixelBuffer extraction,
@@ -103,6 +119,18 @@ public struct MLXTileProcessor: @unchecked Sendable {
     public func process(
         _ rawInput: CVPixelBuffer,
         forward: (MLXArray) throws -> MLXArray
+    ) throws -> CVPixelBuffer {
+        try process(rawInput) { tile, _ in try forward(tile) }
+    }
+
+    /// Region-aware variant of `process(_:forward:)`: identical driving, but the
+    /// closure also receives the tile's `TileRegion` (input-pixel space). Use this
+    /// when the per-tile forward needs to know *where* the tile came from — e.g. to
+    /// slice a precomputed whole-image field (noise, guidance) so it stays
+    /// continuous across tile seams.
+    public func process(
+        _ rawInput: CVPixelBuffer,
+        forward: (MLXArray, TileRegion) throws -> MLXArray
     ) throws -> CVPixelBuffer {
         let input = normalizedBGRA(rawInput)
         let width = CVPixelBufferGetWidth(input)
@@ -181,7 +209,7 @@ public struct MLXTileProcessor: @unchecked Sendable {
 
                 // Wrap scratch as `[1, tileSize, tileSize, 3]` NHWC.
                 let tileArray = MLXArray(tileScratch, [1, tileSize, tileSize, 3])
-                let upscaled = try forward(tileArray)
+                let upscaled = try forward(tileArray, TileRegion(x: x, y: y, width: tw, height: th))
                 // `forward` is contractually expected to MLX.eval before
                 // returning; we re-eval defensively so a stray lazy graph
                 // can't silently zero the read-out.
