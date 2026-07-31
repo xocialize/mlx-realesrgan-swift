@@ -235,20 +235,34 @@ public struct MLXTileProcessor: @unchecked Sendable {
         var accum = SeamAccumulator(outWidth: outWidth, outHeight: outHeight,
                                     rows: tileSize * scale)
 
+        // Clamped tile origins with duplicates collapsed. Clamping alone
+        // (`min(tileX, max(0, width - tileSize))`) makes every stride origin within
+        // `overlap` of the far edge — and ALL of them when the extent is ≤ tileSize —
+        // land on the same position, so the identical tile would be extracted and run
+        // through `forward` once per duplicate. The normalised composite cancels the
+        // repeats out, so this is pure re-compute (measured 4× the diffusion cost per
+        // frame at exactly-one-tile geometry). Same deduplicated grid as
+        // `SeedVR2TemporalRefiner.tileGrid`.
+        var tileYs: [Int] = []
         for tileY in stride(from: 0, to: height, by: step) {
+            let y = min(tileY, max(0, height - tileSize))
+            if tileYs.last != y { tileYs.append(y) }
+        }
+        var tileXs: [Int] = []
+        for tileX in stride(from: 0, to: width, by: step) {
+            let x = min(tileX, max(0, width - tileSize))
+            if tileXs.last != x { tileXs.append(x) }
+        }
+
+        for y in tileYs {
             // Every output row above this tile row's first row is final: flush and slide.
-            accum.flush(upTo: min(tileY, max(0, height - tileSize)) * scale,
-                        dst: dstPtr, dstBPR: dstBPR)
-            for tileX in stride(from: 0, to: width, by: step) {
+            accum.flush(upTo: y * scale, dst: dstPtr, dstBPR: dstBPR)
+            for x in tileXs {
                 // Cooperative cancellation (CAN gate): one checkpoint per 64² tile — the
                 // natural yield point of the tiled forward. Sync code on the run's task sees
                 // the flag; the CancellationError propagates unchanged to the wrapper.
                 try Task.checkCancellation()
                 let span = prof.begin("upscale", "tile", index: tileIndex)
-                // Clamp the tile origin so the last row/column stays inside the
-                // frame (matches TileProcessor's behaviour).
-                let x = min(tileX, max(0, width - tileSize))
-                let y = min(tileY, max(0, height - tileSize))
                 let tw = min(tileSize, width - x)
                 let th = min(tileSize, height - y)
 

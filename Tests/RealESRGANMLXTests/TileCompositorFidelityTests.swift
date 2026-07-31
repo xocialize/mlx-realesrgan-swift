@@ -282,6 +282,39 @@ struct TileCompositorFidelityTests {
         }
     }
 
+    // MARK: - Probe E — duplicate clamped origins must not re-run the forward
+
+    @Test("E. the forward runs exactly once per unique clamped tile origin")
+    func forwardRunsOncePerUniqueOrigin() throws {
+        try withCPU {
+            // (side, unique origins per axis): the exactly-one-tile frame that measured FOUR
+            // identical diffusion calls per frame (V12-D gate probe, 2026-07-31); a sub-tile
+            // frame; a frame whose last stride origin clamps onto the previous one
+            // (2048 = 224·9 + 32); and a full multi-tile frame.
+            let cases: [(Int, Int)] = [(256, 1), (200, 1), (2048, 9), (704, 3)]
+            for (side, perAxis) in cases {
+                let input = makeBGRA(width: side, height: side) { x, y in
+                    (UInt8(x % 256), UInt8(y % 256), UInt8((x + y) % 256))
+                }
+                let tiler = MLXTileProcessor(tileSize: kTile, overlap: kOverlap, scale: 1)
+                var origins = [[Int]]()
+                let out = try tiler.process(input) { tile, region in
+                    origins.append([region.x, region.y])
+                    MLX.eval(tile)
+                    return tile
+                }
+                let unique = Set(origins)
+                #expect(origins.count == perAxis * perAxis,
+                        "\(side)²: forward ran \(origins.count)× for \(unique.count) unique origins")
+                #expect(unique.count == origins.count,
+                        "\(side)²: duplicate clamped origins re-ran the forward")
+                // The dedup must not change output bytes (identity forward is bit-exact).
+                let a = readBGRA(input), b = readBGRA(out)
+                #expect(a.px == b.px, "\(side)²: deduplicated grid changed the composite")
+            }
+        }
+    }
+
     // MARK: - Probe C — the alpha "untouched" flag
 
     @Test("C. CVPixelBufferCreate memory can it come back with a non-zero alpha byte")
