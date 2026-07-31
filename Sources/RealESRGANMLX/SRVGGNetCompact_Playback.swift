@@ -67,8 +67,22 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
 
     public let name: String
     public let scaleFactor: Int
-    public let inputTileSize: Int = 64
-    public let tileOverlap: Int = 8
+    /// Tile geometry for the tiled path. **Injectable, because the shipped 64 is measurably the worst
+    /// of the three sizes on BOTH backends** — `GAP-PROGRAM.md` V13, 1080p→×4 per frame:
+    ///
+    ///     MLX-GPU fp32   t64 1440 ms · t128  808 ms · t256 878 ms
+    ///     CoreAI-ANE     t64 1053 ms · t128  852 ms · t256 953 ms
+    ///
+    /// 🔑 **t128 is the optimum on both, and t64 costs ~1.8× on the shipping backend.** Small tiles lose
+    /// to per-dispatch overhead; very large ones lose to working-set pressure.
+    ///
+    /// ⚠️ **`tileOverlap` is an ABSOLUTE pixel count and should NOT be scaled with the tile.** What the
+    /// overlap has to cover is the network's receptive field, which is a fixed number of pixels and does
+    /// not grow when the tile does. So 8 px at t128 is exactly as much margin as 8 px at t64 — while
+    /// there are *fewer* seams — which is why enlarging the tile is expected to reduce total seam
+    /// artefact rather than increase it despite the smaller overlap *ratio*.
+    public let inputTileSize: Int
+    public let tileOverlap: Int
 
     public var inputResolution: (width: Int, height: Int) {
         (inputTileSize, inputTileSize)
@@ -126,11 +140,17 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
     /// - Parameter wholeFrameMaxPixels: input-pixel ceiling for the single-pass path. Defaults to
     ///   `1920 * 1080`, unchanged from before this became injectable, so existing callers keep their
     ///   exact behaviour. See the property's note for what that default costs.
-    public init(variant: Variant, wholeFrameMaxPixels: Int = 1920 * 1080) throws {
+    /// - Parameters:
+    ///   - inputTileSize/tileOverlap: tile geometry, defaults unchanged from before they became
+    ///     injectable. See the properties for the measured ladder.
+    public init(variant: Variant, wholeFrameMaxPixels: Int = 1920 * 1080,
+                inputTileSize: Int = 64, tileOverlap: Int = 8) throws {
         self.variant = variant
         self.name = variant.tierName
         self.scaleFactor = 4
         self.wholeFrameMaxPixels = wholeFrameMaxPixels
+        self.inputTileSize = inputTileSize
+        self.tileOverlap = tileOverlap
 
         guard let url = Bundle.module.url(
             forResource: variant.safetensorsName,

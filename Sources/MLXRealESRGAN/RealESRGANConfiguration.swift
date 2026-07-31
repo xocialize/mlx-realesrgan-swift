@@ -51,10 +51,18 @@ public struct RealESRGANConfiguration: PackageConfiguration, ModelStorable {
     /// A 16 GB host must lower this; a large-memory host should not.
     public var wholeFrameMaxPixels: Int?
 
+    /// Tile geometry for the tiled path; `nil` keeps the core defaults (64/8).
+    /// ⚠️ 64 is measurably the worst of the three sizes on both backends (V13) — see the core's note.
+    public var inputTileSize: Int?
+    public var tileOverlap: Int?
+
     public init(variant: RealESRGANVariant = .general, modelsRootDirectory: URL? = nil,
-                wholeFrameMaxPixels: Int? = nil) {
+                wholeFrameMaxPixels: Int? = nil,
+                inputTileSize: Int? = nil, tileOverlap: Int? = nil) {
         self.variant = variant
         self.wholeFrameMaxPixels = wholeFrameMaxPixels
+        self.inputTileSize = inputTileSize
+        self.tileOverlap = tileOverlap
         self.modelsRootDirectory = modelsRootDirectory
     }
 
