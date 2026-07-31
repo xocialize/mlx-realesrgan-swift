@@ -94,10 +94,26 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
     /// A/B compares the two backends under the same inference strategy.
     private var compiledForward: (@Sendable (MLXArray) -> MLXArray)?
 
-    /// Whole-frame fast-path ceiling. SRVGGNetCompact is fully convolutional
-    /// (no internal downsampling), so it shares EfRLFN's whole-frame
-    /// treatment; frames above 1080p fall back to 64-px tiling.
-    private let wholeFrameMaxPixels = 1920 * 1080
+    /// Whole-frame fast-path ceiling, in INPUT pixels. SRVGGNetCompact is fully convolutional (no
+    /// internal downsampling), so it shares EfRLFN's whole-frame treatment; inputs above this fall back
+    /// to 64-px tiling.
+    ///
+    /// 🔑 **Injectable, and the default deliberately stays permissive: whole-frame is the QUALITY path
+    /// and the capability must not be capped in the package.** Tiling bounds memory but introduces
+    /// seams; whole-frame has none. A 128 GB machine should be allowed to take it at sizes a 16 GB
+    /// machine cannot, so **the host gates this per machine — the package does not decide for it.**
+    ///
+    /// ⚠️ **Know what the default costs before leaving it alone.** Measured (`GAP-PROGRAM.md` V12,
+    /// process `phys_footprint`, ×4): **3.22 GB at SD** but **21.24 GB at 1920×1080** and 24.64 GB at
+    /// 1080×1920 — because this net runs at its native ×4 internally, so a 1080p input builds a
+    /// 7680×4320 intermediate. ⚠️ And note `processAdaptive` tests `<=`, so **1920×1080 lands exactly on
+    /// the default ceiling and takes the whole-frame path** — the most common video resolution is on the
+    /// expensive side by one comparison. That is *correct* under a quality-first policy and *fatal* on a
+    /// 16 GB machine, which is precisely why the choice belongs to the host.
+    ///
+    /// Suggested host policy: derive from the memory budget, preferring whole-frame wherever it fits.
+    /// Pass `0` to force tiling always.
+    public let wholeFrameMaxPixels: Int
 
     // MARK: - Init
 
@@ -107,10 +123,14 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
     /// itself supports any integer scale ≥ 1, but mismatched weight + scale
     /// pairs would fail at safetensors load time. We pin scale=4 here for
     /// the same forward-compat reason `EfRLFN_Playback` does.
-    public init(variant: Variant) throws {
+    /// - Parameter wholeFrameMaxPixels: input-pixel ceiling for the single-pass path. Defaults to
+    ///   `1920 * 1080`, unchanged from before this became injectable, so existing callers keep their
+    ///   exact behaviour. See the property's note for what that default costs.
+    public init(variant: Variant, wholeFrameMaxPixels: Int = 1920 * 1080) throws {
         self.variant = variant
         self.name = variant.tierName
         self.scaleFactor = 4
+        self.wholeFrameMaxPixels = wholeFrameMaxPixels
 
         guard let url = Bundle.module.url(
             forResource: variant.safetensorsName,

@@ -73,7 +73,11 @@ public final class RealESRGANUpscalePackage: ModelPackage {
         guard upscaler == nil else { return }
         // Weights are vendored in the core bundle; construction validates their presence.
         // (The core lazy-loads tensors on first upscale.)
-        upscaler = try SRVGGNetCompact_Playback(variant: configuration.variant.coreVariant)
+        // Forward the host's ceiling; `nil` keeps the core's permissive whole-frame-preferring default.
+        upscaler = try configuration.wholeFrameMaxPixels.map {
+            try SRVGGNetCompact_Playback(variant: configuration.variant.coreVariant,
+                                         wholeFrameMaxPixels: $0)
+        } ?? SRVGGNetCompact_Playback(variant: configuration.variant.coreVariant)
     }
 
     public func unload() async {

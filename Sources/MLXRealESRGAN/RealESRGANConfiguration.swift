@@ -38,8 +38,23 @@ public struct RealESRGANConfiguration: PackageConfiguration, ModelStorable {
     /// specific → excluded from `Codable`.
     public var modelsRootDirectory: URL?
 
-    public init(variant: RealESRGANVariant = .general, modelsRootDirectory: URL? = nil) {
+    /// Whole-frame fast-path ceiling in INPUT pixels, forwarded to the core.
+    ///
+    /// 🔑 **`nil` keeps the core's permissive default (`1920*1080`), which prefers the WHOLE-FRAME
+    /// quality path — no tiles, no seams.** The package deliberately does not cap this: a 128 GB
+    /// machine should be able to take whole-frame at sizes a 16 GB machine cannot. **The host gates it
+    /// per machine rather than the package limiting the ability.**
+    ///
+    /// ⚠️ Measured cost of the default (`GAP-PROGRAM.md` V12, `phys_footprint`, ×4): 3.22 GB at SD,
+    /// **21.24 GB at 1920×1080**. This net runs at its native ×4 internally, so a 1080p input builds a
+    /// 7680×4320 intermediate — and 1920×1080 sits exactly on the ceiling, which `<=` sends whole-frame.
+    /// A 16 GB host must lower this; a large-memory host should not.
+    public var wholeFrameMaxPixels: Int?
+
+    public init(variant: RealESRGANVariant = .general, modelsRootDirectory: URL? = nil,
+                wholeFrameMaxPixels: Int? = nil) {
         self.variant = variant
+        self.wholeFrameMaxPixels = wholeFrameMaxPixels
         self.modelsRootDirectory = modelsRootDirectory
     }
 
