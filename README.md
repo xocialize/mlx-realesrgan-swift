@@ -3,7 +3,7 @@
 The MLXEngine **`imageUpscale`** package over [Real-ESRGAN](https://github.com/xocialize/realesrgan-mlx-swift) (SRVGGNetCompact) — 4× image super-resolution on Apple Silicon.
 
 A transform capability of the visual optimization tier, chaining after `imageRestore` (and onto
-T2I/decode output) before encode. All model logic — SRVGGNet, 64² tiling with feathered seam
+T2I/decode output) before encode. All model logic — SRVGGNet, 128² tiling with feathered seam
 blending — lives in the core; this package maps the canonical
 `ImageUpscaleRequest → ImageUpscaleResponse` contract onto it. **No download:** all variants are
 vendored in the core bundle (1–2 MB each, BSD-3).

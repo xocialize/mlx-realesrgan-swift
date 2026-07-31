@@ -56,7 +56,7 @@ public protocol PlaybackTier: Sendable {
 
     /// Tile-to-tile overlap in input-resolution pixels. Plan §D.2 standardises
     /// on a 1:8 ratio (`tileOverlap == inputTileSize / 8`), which yields 16 px
-    /// for EfRLFN's 128 tiles and 8 px for SRVGGNetCompact's 64 tiles.
+    /// for EfRLFN's 128 tiles and 8 px for SRVGGNetCompact's (since 0.7.0, also 128) tiles. ⚠️ Overlap is ABSOLUTE — it covers the receptive field, so it does not scale with the tile.
     var tileOverlap: Int { get }
 
     /// Convenience: `(inputTileSize, inputTileSize)`. Reported as a tuple

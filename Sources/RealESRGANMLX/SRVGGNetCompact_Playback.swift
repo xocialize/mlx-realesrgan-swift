@@ -10,12 +10,15 @@
 // Upstream: https://github.com/xinntao/Real-ESRGAN (BSD-3-Clause)
 // Weights:  Resources/realesr_{general,general_wdn,anime}_x4.safetensors
 //
-// Tile shape: 64 / 8 — matches the upstream `realesr-general-x4v3`
-// `inference_realesrgan_video.py` training/inference tile size. Same
-// 1:8 ratio as EfRLFN's 128/16 (per plan §D.2 convention) — just at a
-// finer grid because SRVGGNetCompact's tiny body (~0.6–1.2 M params)
-// runs natively on small tiles and a coarser grid would lose more to
-// the seam-blend overlap than it gains in per-tile throughput.
+// Tile shape: 128 / 8 as of 0.7.0. It was 64 / 8, matching upstream
+// `inference_realesrgan_video.py`, on the reasoning that "a coarser grid
+// would lose more to the seam-blend overlap than it gains in per-tile
+// throughput." 🚨 **That reasoning was wrong on both halves and is kept
+// here as the record of it.** Overlap is absolute, not a ratio, so a
+// coarser grid loses nothing to seam blending — and 64 was the SLOWEST of
+// {64,128,256} on both the MLX-GPU and CoreAI-ANE backends. Measured:
+// 4.65× faster end to end, with the seam z-test detecting a seam at 64
+// and none at 128. See `inputTileSize` for both receipts.
 //
 // Lazy init: weights load on first `upscale(_:)` behind an `NSLock` so
 // the protocol-conformance / surface-query path stays free.
@@ -67,20 +70,37 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
 
     public let name: String
     public let scaleFactor: Int
-    /// Tile geometry for the tiled path. **Injectable, because the shipped 64 is measurably the worst
-    /// of the three sizes on BOTH backends** — `GAP-PROGRAM.md` V13, 1080p→×4 per frame:
+    /// Tile geometry for the tiled path. **The default is 128 as of 0.7.0** — the previous 64 was
+    /// measurably the worst of the three sizes on BOTH backends (`GAP-PROGRAM.md` V13, 1080p→×4 per
+    /// frame):
     ///
     ///     MLX-GPU fp32   t64 1440 ms · t128  808 ms · t256 878 ms
     ///     CoreAI-ANE     t64 1053 ms · t128  852 ms · t256 953 ms
     ///
-    /// 🔑 **t128 is the optimum on both, and t64 costs ~1.8× on the shipping backend.** Small tiles lose
-    /// to per-dispatch overhead; very large ones lose to working-set pressure.
+    /// 🔑 **t128 is the optimum on both, and t64 cost ~1.8× on the shipping backend.** Small tiles lose
+    /// to per-dispatch overhead; very large ones lose to working-set pressure. End-to-end through the
+    /// app's shipping path the win is larger than the per-frame ladder suggests — 2048²→8192² ×4 went
+    /// **7.68 s → 1.65 s (4.65×)**, because tile count falls quadratically (1369 → 324 positions).
     ///
-    /// ⚠️ **`tileOverlap` is an ABSOLUTE pixel count and should NOT be scaled with the tile.** What the
+    /// ⚠️ **`tileOverlap` is an ABSOLUTE pixel count and must NOT be scaled with the tile.** What the
     /// overlap has to cover is the network's receptive field, which is a fixed number of pixels and does
     /// not grow when the tile does. So 8 px at t128 is exactly as much margin as 8 px at t64 — while
-    /// there are *fewer* seams — which is why enlarging the tile is expected to reduce total seam
-    /// artefact rather than increase it despite the smaller overlap *ratio*.
+    /// there are *fewer* seams — which is why enlarging the tile *reduces* total seam artefact rather
+    /// than increasing it, despite the smaller overlap *ratio*.
+    ///
+    /// ✅ **That is measured, not reasoned.** Seam test on `SNS_graphic` 8192², restricted to flat blocks
+    /// (the only regions where a 1-LSB discontinuity is visible), each arm scored at its own stride and
+    /// z-tested against a null sweep of ~166 off-strides:
+    ///
+    ///     t64  @ stride 224:  z = +1.50, boundary/interior 1.384  → SEAM (null 95th pct +0.84)
+    ///     t128 @ stride 480:  z = +0.46, boundary/interior 1.056  → none above noise
+    ///
+    /// The arms agree numerically (p99 |Δ| = 2/255; 186 of 67 M pixels exceed 32), and what disagreement
+    /// there is concentrates 1.54× on t64's own 224 lattice — i.e. t128 differs from t64 chiefly *at the
+    /// seams t64 has*. Faster and cleaner, not a trade.
+    ///
+    /// ⚠️ **Do not "improve" this by raising `tileOverlap` alongside the tile.** Overlap ratio is the
+    /// wrong intuition here and costs throughput for no margin.
     public let inputTileSize: Int
     public let tileOverlap: Int
 
@@ -110,7 +130,7 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
 
     /// Whole-frame fast-path ceiling, in INPUT pixels. SRVGGNetCompact is fully convolutional (no
     /// internal downsampling), so it shares EfRLFN's whole-frame treatment; inputs above this fall back
-    /// to 64-px tiling.
+    /// to tiling at `inputTileSize` (128 by default).
     ///
     /// 🔑 **Injectable, and the default deliberately stays permissive: whole-frame is the QUALITY path
     /// and the capability must not be capped in the package.** Tiling bounds memory but introduces
@@ -141,10 +161,12 @@ public final class SRVGGNetCompact_Playback: PlaybackTier, @unchecked Sendable {
     ///   `1920 * 1080`, unchanged from before this became injectable, so existing callers keep their
     ///   exact behaviour. See the property's note for what that default costs.
     /// - Parameters:
-    ///   - inputTileSize/tileOverlap: tile geometry, defaults unchanged from before they became
-    ///     injectable. See the properties for the measured ladder.
+    ///   - inputTileSize: **changed 64 → 128 in 0.7.0.** Faster (4.65× end-to-end at 8192² output) and
+    ///     seam-free where 64 was not; see the property for both measurements. A caller that needs the
+    ///     old geometry passes `inputTileSize: 64` explicitly.
+    ///   - tileOverlap: absolute pixels, unchanged at 8 — and deliberately NOT scaled with the tile.
     public init(variant: Variant, wholeFrameMaxPixels: Int = 1920 * 1080,
-                inputTileSize: Int = 64, tileOverlap: Int = 8) throws {
+                inputTileSize: Int = 128, tileOverlap: Int = 8) throws {
         self.variant = variant
         self.name = variant.tierName
         self.scaleFactor = 4
