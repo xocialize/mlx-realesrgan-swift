@@ -236,6 +236,7 @@ public struct MLXTileProcessor: @unchecked Sendable {
             throw PlaybackTierError.inferenceError("CVPixelBuffer base address is nil (output)")
         }
         let srcPtr = srcBase.assumingMemoryBound(to: UInt8.self)
+        let dstPtr = dstBase.assumingMemoryBound(to: UInt8.self)
         let srcBPR = CVPixelBufferGetBytesPerRow(input)
         let dstBPR = CVPixelBufferGetBytesPerRow(output)
 
@@ -278,7 +279,11 @@ public struct MLXTileProcessor: @unchecked Sendable {
 
         for y in tileYs {
             // Every output row above this tile row's first row is final: flush and slide.
-            accum.flush(upTo: y * scale, dst: dstBase, dstBPR: dstBPR, deep: deep)
+            if deep {
+                accum.flush16(upTo: y * scale, dst: dstBase, dstBPR: dstBPR)
+            } else {
+                accum.flush(upTo: y * scale, dst: dstPtr, dstBPR: dstBPR)
+            }
             for x in tileXs {
                 // Cooperative cancellation (CAN gate): one checkpoint per 64² tile — the
                 // natural yield point of the tiled forward. Sync code on the run's task sees
@@ -358,7 +363,11 @@ public struct MLXTileProcessor: @unchecked Sendable {
                 tileIndex += 1
             }
         }
-        accum.flush(upTo: outHeight, dst: dstBase, dstBPR: dstBPR, deep: deep)
+        if deep {
+            accum.flush16(upTo: outHeight, dst: dstBase, dstBPR: dstBPR)
+        } else {
+            accum.flush(upTo: outHeight, dst: dstPtr, dstBPR: dstBPR)
+        }
 
         return output
     }
@@ -435,20 +444,7 @@ public struct MLXTileProcessor: @unchecked Sendable {
         // BGRA → NHWC RGB float32 [0, 1] for the whole frame.
         var scratch = [Float](repeating: 0, count: width * height * 3)
         if deep {
-            // RGBA16 → NHWC RGB float32 [0, 1]: the same reciprocal-multiply form as the 8-bit lift.
-            scratch.withUnsafeMutableBufferPointer { buf in
-                let base = buf.baseAddress!
-                let inv = Float(1.0 / 65535.0)
-                for yy in 0 ..< height {
-                    let row = (srcBase + yy * srcBPR).assumingMemoryBound(to: UInt16.self)
-                    for xx in 0 ..< width {
-                        let d = (yy * width + xx) * 3
-                        base[d + 0] = Float(UInt16(littleEndian: row[xx * 4 + 0])) * inv
-                        base[d + 1] = Float(UInt16(littleEndian: row[xx * 4 + 1])) * inv
-                        base[d + 2] = Float(UInt16(littleEndian: row[xx * 4 + 2])) * inv
-                    }
-                }
-            }
+            Self.liftRGBA16(src: srcBase, srcBPR: srcBPR, width: width, height: height, into: &scratch)
         } else {
             scratch.withUnsafeMutableBufferPointer { buf in
                 let base = buf.baseAddress!
@@ -488,20 +484,7 @@ public struct MLXTileProcessor: @unchecked Sendable {
         let copyH = min(oH, outHeight)
         let copyW = min(oW, outWidth)
         if deep {
-            // RGB float32 → RGBA16, rounded once, opaque — the 8-bit write below at 65535 steps.
-            outFloats.withUnsafeBufferPointer { buf in
-                let base = buf.baseAddress!
-                for yy in 0 ..< copyH {
-                    let row = (dstBase + yy * dstBPR).assumingMemoryBound(to: UInt16.self)
-                    for xx in 0 ..< copyW {
-                        let s = (yy * oW + xx) * 3
-                        for c in 0 ..< 3 {
-                            row[xx * 4 + c] = UInt16((max(0, min(1, base[s + c])) * 65535).rounded()).littleEndian
-                        }
-                        row[xx * 4 + 3] = UInt16.max
-                    }
-                }
-            }
+            Self.writeRGBA16(outFloats, rowStride: oW, width: copyW, height: copyH, dst: dstBase, dstBPR: dstBPR)
             MLXProfiler.shared.end(span)
             return output
         }
@@ -589,9 +572,17 @@ public struct MLXTileProcessor: @unchecked Sendable {
         }
     }
 
+    // MARK: - 16-bit lift and write (deepPixelFormat)
+    //
+    // 🚨 These live in their own NON-throwing, `@inline(never)` functions on purpose. Inlined into the throwing
+    // drivers above, Swift 6.4's optimizer (Release / WMO only — Debug was clean and byte-identical) let a scratch
+    // value leak into the swifterror register: `process` / `processWholeFrame` returned normally but the caller saw
+    // a garbage error (`0x2bbff` on the 8-bit tiled path, `0xffff` — the alpha store — on the 16-bit one) and
+    // crashed retaining it. v0.8.0 shipped that; 0.8.1 is this layout. Keep the 16-bit loops out of the drivers.
+
     /// `fillWindowScratch` for a `deepPixelFormat` source: RGBA UInt16 → RGB float32 [0, 1], same window and
     /// edge-replication rules.
-    @inline(__always)
+    @inline(never)
     private func fillWindowScratch16(
         src: UnsafeMutableRawPointer,
         srcBPR: Int,
@@ -611,6 +602,46 @@ public struct MLXTileProcessor: @unchecked Sendable {
                     base[dstOff + 0] = Float(UInt16(littleEndian: row[srcX * 4 + 0])) * scale
                     base[dstOff + 1] = Float(UInt16(littleEndian: row[srcX * 4 + 1])) * scale
                     base[dstOff + 2] = Float(UInt16(littleEndian: row[srcX * 4 + 2])) * scale
+                }
+            }
+        }
+    }
+
+    /// Whole-frame lift of a `deepPixelFormat` source: RGBA UInt16 → NHWC RGB float32 [0, 1], the same
+    /// reciprocal-multiply form as the 8-bit lift.
+    @inline(never)
+    private static func liftRGBA16(src: UnsafeMutableRawPointer, srcBPR: Int, width: Int, height: Int,
+                                   into scratch: inout [Float]) {
+        scratch.withUnsafeMutableBufferPointer { buf in
+            let base = buf.baseAddress!
+            let inv = Float(1.0 / 65535.0)
+            for yy in 0 ..< height {
+                let row = (src + yy * srcBPR).assumingMemoryBound(to: UInt16.self)
+                for xx in 0 ..< width {
+                    let d = (yy * width + xx) * 3
+                    base[d + 0] = Float(UInt16(littleEndian: row[xx * 4 + 0])) * inv
+                    base[d + 1] = Float(UInt16(littleEndian: row[xx * 4 + 1])) * inv
+                    base[d + 2] = Float(UInt16(littleEndian: row[xx * 4 + 2])) * inv
+                }
+            }
+        }
+    }
+
+    /// Whole-frame write into a `deepPixelFormat` destination: RGB float32 → RGBA16, clamped, rounded once,
+    /// opaque — the 8-bit write at 65535 steps.
+    @inline(never)
+    private static func writeRGBA16(_ floats: [Float], rowStride: Int, width: Int, height: Int,
+                                    dst: UnsafeMutableRawPointer, dstBPR: Int) {
+        floats.withUnsafeBufferPointer { buf in
+            let base = buf.baseAddress!
+            for yy in 0 ..< height {
+                let row = (dst + yy * dstBPR).assumingMemoryBound(to: UInt16.self)
+                for xx in 0 ..< width {
+                    let s = (yy * rowStride + xx) * 3
+                    for c in 0 ..< 3 {
+                        row[xx * 4 + c] = UInt16((max(0, min(1, base[s + c])) * 65535).rounded()).littleEndian
+                    }
+                    row[xx * 4 + 3] = UInt16.max
                 }
             }
         }
@@ -733,52 +764,75 @@ private struct SeamAccumulator {
     /// Resolve and write every band row below `yEnd` into the destination, then slide the band
     /// so it starts at `yEnd`. Rows no tile ever covered are written as opaque black rather
     /// than left alone — the destination buffer's prior contents are never a valid answer.
-    mutating func flush(upTo yEnd: Int, dst rawDst: UnsafeMutableRawPointer, dstBPR: Int, deep: Bool = false) {
+    mutating func flush(upTo yEnd: Int, dst: UnsafeMutablePointer<UInt8>, dstBPR: Int) {
         let end = min(yEnd, outHeight)
         guard end > y0 else { return }
         let n = end - y0
-        let dst = rawDst.assumingMemoryBound(to: UInt8.self)
 
         colour.withUnsafeMutableBufferPointer { col in
             weight.withUnsafeMutableBufferPointer { wgt in
                 let c = col.baseAddress!, w = wgt.baseAddress!
-                if deep {
-                    // The same divide-once, round-once resolve, into RGBA16 (`deepPixelFormat`).
-                    for row in 0 ..< min(n, rows) {
-                        let out = (rawDst + (y0 + row) * dstBPR).assumingMemoryBound(to: UInt16.self)
-                        for x in 0 ..< outWidth {
-                            let p = row * outWidth + x
-                            let sw = w[p]
-                            for ch in 0 ..< 3 {
-                                let v = sw > 0 ? (max(0, min(1, c[p * 3 + ch] / sw)) * 65535).rounded() : 0
-                                out[x * 4 + ch] = UInt16(v).littleEndian
-                            }
-                            out[x * 4 + 3] = UInt16.max
+                for row in 0 ..< min(n, rows) {
+                    let dstRow = (y0 + row) * dstBPR
+                    for x in 0 ..< outWidth {
+                        let p = row * outWidth + x
+                        let sw = w[p]
+                        let d = dstRow + x * 4
+                        if sw > 0 {
+                            let inv = 1.0 / sw
+                            // Divide once, quantise once, ROUND — truncating here is what put a
+                            // one-sided −1 LSB bias in the overlap bands.
+                            let r = (max(0, min(1, c[p * 3 + 0] * inv)) * 255).rounded()
+                            let g = (max(0, min(1, c[p * 3 + 1] * inv)) * 255).rounded()
+                            let b = (max(0, min(1, c[p * 3 + 2] * inv)) * 255).rounded()
+                            dst[d + 0] = UInt8(b); dst[d + 1] = UInt8(g); dst[d + 2] = UInt8(r)
+                        } else {
+                            dst[d + 0] = 0; dst[d + 1] = 0; dst[d + 2] = 0
                         }
-                    }
-                } else {
-                    for row in 0 ..< min(n, rows) {
-                        let dstRow = (y0 + row) * dstBPR
-                        for x in 0 ..< outWidth {
-                            let p = row * outWidth + x
-                            let sw = w[p]
-                            let d = dstRow + x * 4
-                            if sw > 0 {
-                                let inv = 1.0 / sw
-                                // Divide once, quantise once, ROUND — truncating here is what put a
-                                // one-sided −1 LSB bias in the overlap bands.
-                                let r = (max(0, min(1, c[p * 3 + 0] * inv)) * 255).rounded()
-                                let g = (max(0, min(1, c[p * 3 + 1] * inv)) * 255).rounded()
-                                let b = (max(0, min(1, c[p * 3 + 2] * inv)) * 255).rounded()
-                                dst[d + 0] = UInt8(b); dst[d + 1] = UInt8(g); dst[d + 2] = UInt8(r)
-                            } else {
-                                dst[d + 0] = 0; dst[d + 1] = 0; dst[d + 2] = 0
-                            }
-                            dst[d + 3] = 255
-                        }
+                        dst[d + 3] = 255
                     }
                 }
                 // Slide: keep the still-open rows, zero what they vacate.
+                let keep = rows - min(n, rows)
+                if keep > 0 {
+                    memmove(c, c + n * outWidth * 3, keep * outWidth * 3 * MemoryLayout<Float>.size)
+                    memmove(w, w + n * outWidth, keep * outWidth * MemoryLayout<Float>.size)
+                }
+                memset(c + keep * outWidth * 3, 0, (rows - keep) * outWidth * 3 * MemoryLayout<Float>.size)
+                memset(w + keep * outWidth, 0, (rows - keep) * outWidth * MemoryLayout<Float>.size)
+            }
+        }
+        y0 = end
+    }
+
+    /// `flush` into a `MLXTileProcessor.deepPixelFormat` destination (RGBA, UInt16 little-endian): the same
+    /// divide-once, round-once resolve at 65535 steps, alpha opaque. Kept as its own function so the 8-bit
+    /// `flush` above stays exactly what it was.
+    @inline(never)
+    mutating func flush16(upTo yEnd: Int, dst: UnsafeMutableRawPointer, dstBPR: Int) {
+        let end = min(yEnd, outHeight)
+        guard end > y0 else { return }
+        let n = end - y0
+
+        colour.withUnsafeMutableBufferPointer { col in
+            weight.withUnsafeMutableBufferPointer { wgt in
+                let c = col.baseAddress!, w = wgt.baseAddress!
+                for row in 0 ..< min(n, rows) {
+                    let out = (dst + (y0 + row) * dstBPR).assumingMemoryBound(to: UInt16.self)
+                    for x in 0 ..< outWidth {
+                        let p = row * outWidth + x
+                        let sw = w[p]
+                        if sw > 0 {
+                            let inv = 1.0 / sw
+                            for ch in 0 ..< 3 {
+                                out[x * 4 + ch] = UInt16((max(0, min(1, c[p * 3 + ch] * inv)) * 65535).rounded()).littleEndian
+                            }
+                        } else {
+                            out[x * 4 + 0] = 0; out[x * 4 + 1] = 0; out[x * 4 + 2] = 0
+                        }
+                        out[x * 4 + 3] = UInt16.max
+                    }
+                }
                 let keep = rows - min(n, rows)
                 if keep > 0 {
                     memmove(c, c + n * outWidth * 3, keep * outWidth * 3 * MemoryLayout<Float>.size)
