@@ -20,6 +20,11 @@
 //     EfRLFN and SRVGGNetCompact training preprocessing).
 //   - RGB float32 [0, 1] → BGRA UInt8 on the way out with feathered seam
 //     blending and per-pixel clamp.
+//   - 16-bit (AB-A-0158, MLXToolKit contract 1.52.0 `.rawRGBA16`): a
+//     `kCVPixelFormatType_64RGBALE` input (`MLXTileProcessor.deepPixelFormat`)
+//     is read as RGBA UInt16 / 65535 and written back as 64RGBALE — the output
+//     always has the input's depth. Every other format takes the 8-bit path,
+//     byte for byte as before.
 //   - `MLX.eval(output)` is called inside the per-tile forward — required
 //     before pulling values into CVPixelBuffer (MLX is lazy; an unevaluated
 //     tensor materialises as zeros, the silent killer from mlx-porting).
@@ -85,6 +90,21 @@ public struct MLXTileProcessor: @unchecked Sendable {
         self.tileSize = tileSize
         self.overlap = overlap
         self.scale = scale
+    }
+
+    /// The 16-bit layout the driver reads and writes natively: RGBA, 16 bits per component, little-endian,
+    /// 0…65535 — MLXToolKit's `.rawRGBA16` (contract 1.52.0) as a `CVPixelBuffer`. Hand the driver a buffer in
+    /// this format and the result comes back in it, at 16 bits; anything else runs the 8-bit BGRA path.
+    public static let deepPixelFormat: OSType = kCVPixelFormatType_64RGBALE
+
+    /// Whether `buffer` takes the 16-bit path.
+    public static func isDeep(_ buffer: CVPixelBuffer) -> Bool {
+        CVPixelBufferGetPixelFormatType(buffer) == deepPixelFormat
+    }
+
+    /// The input as the driver reads it: a 16-bit buffer as-is, anything else normalised to 32BGRA.
+    private func normalizedInput(_ input: CVPixelBuffer) -> CVPixelBuffer {
+        Self.isDeep(input) ? input : normalizedBGRA(input)
     }
 
     /// Normalise any incoming `CVPixelBuffer` to packed 32BGRA.
@@ -176,7 +196,10 @@ public struct MLXTileProcessor: @unchecked Sendable {
         forward: (MLXArray, TileRegion) throws -> MLXArray
     ) throws -> CVPixelBuffer {
         precondition(halo >= 0, "halo must be non-negative, got \(halo)")
-        let input = normalizedBGRA(rawInput)
+        let input = normalizedInput(rawInput)
+        // 16 bits in ⇒ 16 bits out (`deepPixelFormat`); every other input runs the 8-bit path unchanged.
+        let deep = Self.isDeep(input)
+        let outFormat = deep ? Self.deepPixelFormat : kCVPixelFormatType_32BGRA
         let width = CVPixelBufferGetWidth(input)
         let height = CVPixelBufferGetHeight(input)
         let outWidth = width * scale
@@ -185,12 +208,12 @@ public struct MLXTileProcessor: @unchecked Sendable {
 
         var outputBuffer: CVPixelBuffer?
         let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: outFormat,
             kCVPixelBufferWidthKey as String: outWidth,
             kCVPixelBufferHeightKey as String: outHeight,
         ]
         let status = CVPixelBufferCreate(
-            nil, outWidth, outHeight, kCVPixelFormatType_32BGRA,
+            nil, outWidth, outHeight, outFormat,
             attrs as CFDictionary, &outputBuffer
         )
         guard status == kCVReturnSuccess, let output = outputBuffer else {
@@ -213,7 +236,6 @@ public struct MLXTileProcessor: @unchecked Sendable {
             throw PlaybackTierError.inferenceError("CVPixelBuffer base address is nil (output)")
         }
         let srcPtr = srcBase.assumingMemoryBound(to: UInt8.self)
-        let dstPtr = dstBase.assumingMemoryBound(to: UInt8.self)
         let srcBPR = CVPixelBufferGetBytesPerRow(input)
         let dstBPR = CVPixelBufferGetBytesPerRow(output)
 
@@ -256,7 +278,7 @@ public struct MLXTileProcessor: @unchecked Sendable {
 
         for y in tileYs {
             // Every output row above this tile row's first row is final: flush and slide.
-            accum.flush(upTo: y * scale, dst: dstPtr, dstBPR: dstBPR)
+            accum.flush(upTo: y * scale, dst: dstBase, dstBPR: dstBPR, deep: deep)
             for x in tileXs {
                 // Cooperative cancellation (CAN gate): one checkpoint per 64² tile — the
                 // natural yield point of the tiled forward. Sync code on the run's task sees
@@ -271,13 +293,23 @@ public struct MLXTileProcessor: @unchecked Sendable {
                 // clamps to the nearest valid pixel (edge replication, same approach as
                 // TileProcessor) — but inside the frame the halo reads REAL neighbouring
                 // pixels, which is the entire point of context padding.
-                fillWindowScratch(
-                    src: srcPtr,
-                    srcBPR: srcBPR,
-                    windowX: x - halo, windowY: y - halo, windowSize: windowSize,
-                    frameW: width, frameH: height,
-                    scratch: &tileScratch
-                )
+                if deep {
+                    fillWindowScratch16(
+                        src: srcBase,
+                        srcBPR: srcBPR,
+                        windowX: x - halo, windowY: y - halo, windowSize: windowSize,
+                        frameW: width, frameH: height,
+                        scratch: &tileScratch
+                    )
+                } else {
+                    fillWindowScratch(
+                        src: srcPtr,
+                        srcBPR: srcBPR,
+                        windowX: x - halo, windowY: y - halo, windowSize: windowSize,
+                        frameW: width, frameH: height,
+                        scratch: &tileScratch
+                    )
+                }
 
                 // Wrap scratch as `[1, windowSize, windowSize, 3]` NHWC.
                 let tileArray = MLXArray(tileScratch, [1, windowSize, windowSize, 3])
@@ -326,7 +358,7 @@ public struct MLXTileProcessor: @unchecked Sendable {
                 tileIndex += 1
             }
         }
-        accum.flush(upTo: outHeight, dst: dstPtr, dstBPR: dstBPR)
+        accum.flush(upTo: outHeight, dst: dstBase, dstBPR: dstBPR, deep: deep)
 
         return output
     }
@@ -368,13 +400,15 @@ public struct MLXTileProcessor: @unchecked Sendable {
         _ rawInput: CVPixelBuffer,
         forward: (MLXArray) throws -> MLXArray
     ) throws -> CVPixelBuffer {
-        let input = normalizedBGRA(rawInput)
+        let input = normalizedInput(rawInput)
+        let deep = Self.isDeep(input)
         let width = CVPixelBufferGetWidth(input)
         let height = CVPixelBufferGetHeight(input)
         let outWidth = width * scale
         let outHeight = height * scale
 
-        let output = try makeOutputBuffer(outWidth, outHeight)
+        let output = try makeOutputBuffer(outWidth, outHeight,
+                                          format: deep ? Self.deepPixelFormat : kCVPixelFormatType_32BGRA)
 
         CVPixelBufferLockBaseAddress(input, .readOnly)
         CVPixelBufferLockBaseAddress(output, [])
@@ -400,20 +434,37 @@ public struct MLXTileProcessor: @unchecked Sendable {
 
         // BGRA → NHWC RGB float32 [0, 1] for the whole frame.
         var scratch = [Float](repeating: 0, count: width * height * 3)
-        scratch.withUnsafeMutableBufferPointer { buf in
-            let base = buf.baseAddress!
-            let inv = Float(1.0 / 255.0)
-            for yy in 0 ..< height {
-                let rowOff = yy * srcBPR
-                for xx in 0 ..< width {
-                    let off = rowOff + xx * 4
-                    let b = Float(srcPtr[off + 0]) * inv
-                    let g = Float(srcPtr[off + 1]) * inv
-                    let r = Float(srcPtr[off + 2]) * inv
-                    let d = (yy * width + xx) * 3
-                    base[d + 0] = r
-                    base[d + 1] = g
-                    base[d + 2] = b
+        if deep {
+            // RGBA16 → NHWC RGB float32 [0, 1]: the same reciprocal-multiply form as the 8-bit lift.
+            scratch.withUnsafeMutableBufferPointer { buf in
+                let base = buf.baseAddress!
+                let inv = Float(1.0 / 65535.0)
+                for yy in 0 ..< height {
+                    let row = (srcBase + yy * srcBPR).assumingMemoryBound(to: UInt16.self)
+                    for xx in 0 ..< width {
+                        let d = (yy * width + xx) * 3
+                        base[d + 0] = Float(UInt16(littleEndian: row[xx * 4 + 0])) * inv
+                        base[d + 1] = Float(UInt16(littleEndian: row[xx * 4 + 1])) * inv
+                        base[d + 2] = Float(UInt16(littleEndian: row[xx * 4 + 2])) * inv
+                    }
+                }
+            }
+        } else {
+            scratch.withUnsafeMutableBufferPointer { buf in
+                let base = buf.baseAddress!
+                let inv = Float(1.0 / 255.0)
+                for yy in 0 ..< height {
+                    let rowOff = yy * srcBPR
+                    for xx in 0 ..< width {
+                        let off = rowOff + xx * 4
+                        let b = Float(srcPtr[off + 0]) * inv
+                        let g = Float(srcPtr[off + 1]) * inv
+                        let r = Float(srcPtr[off + 2]) * inv
+                        let d = (yy * width + xx) * 3
+                        base[d + 0] = r
+                        base[d + 1] = g
+                        base[d + 2] = b
+                    }
                 }
             }
         }
@@ -436,6 +487,24 @@ public struct MLXTileProcessor: @unchecked Sendable {
 
         let copyH = min(oH, outHeight)
         let copyW = min(oW, outWidth)
+        if deep {
+            // RGB float32 → RGBA16, rounded once, opaque — the 8-bit write below at 65535 steps.
+            outFloats.withUnsafeBufferPointer { buf in
+                let base = buf.baseAddress!
+                for yy in 0 ..< copyH {
+                    let row = (dstBase + yy * dstBPR).assumingMemoryBound(to: UInt16.self)
+                    for xx in 0 ..< copyW {
+                        let s = (yy * oW + xx) * 3
+                        for c in 0 ..< 3 {
+                            row[xx * 4 + c] = UInt16((max(0, min(1, base[s + c])) * 65535).rounded()).littleEndian
+                        }
+                        row[xx * 4 + 3] = UInt16.max
+                    }
+                }
+            }
+            MLXProfiler.shared.end(span)
+            return output
+        }
         outFloats.withUnsafeBufferPointer { buf in
             let base = buf.baseAddress!
             for yy in 0 ..< copyH {
@@ -462,16 +531,16 @@ public struct MLXTileProcessor: @unchecked Sendable {
         return output
     }
 
-    /// Allocate a BGRA output `CVPixelBuffer` at the given dimensions.
-    private func makeOutputBuffer(_ outWidth: Int, _ outHeight: Int) throws -> CVPixelBuffer {
+    /// Allocate an output `CVPixelBuffer` (32BGRA, or `deepPixelFormat`) at the given dimensions.
+    private func makeOutputBuffer(_ outWidth: Int, _ outHeight: Int, format: OSType) throws -> CVPixelBuffer {
         var outputBuffer: CVPixelBuffer?
         let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferPixelFormatTypeKey as String: format,
             kCVPixelBufferWidthKey as String: outWidth,
             kCVPixelBufferHeightKey as String: outHeight,
         ]
         let status = CVPixelBufferCreate(
-            nil, outWidth, outHeight, kCVPixelFormatType_32BGRA,
+            nil, outWidth, outHeight, format,
             attrs as CFDictionary, &outputBuffer
         )
         guard status == kCVReturnSuccess, let output = outputBuffer else {
@@ -515,6 +584,33 @@ public struct MLXTileProcessor: @unchecked Sendable {
                     base[dstOff + 0] = r
                     base[dstOff + 1] = g
                     base[dstOff + 2] = b
+                }
+            }
+        }
+    }
+
+    /// `fillWindowScratch` for a `deepPixelFormat` source: RGBA UInt16 → RGB float32 [0, 1], same window and
+    /// edge-replication rules.
+    @inline(__always)
+    private func fillWindowScratch16(
+        src: UnsafeMutableRawPointer,
+        srcBPR: Int,
+        windowX: Int, windowY: Int, windowSize: Int,
+        frameW: Int, frameH: Int,
+        scratch: inout [Float]
+    ) {
+        scratch.withUnsafeMutableBufferPointer { buf in
+            let base = buf.baseAddress!
+            let scale = Float(1.0 / 65535.0)
+            for ty in 0 ..< windowSize {
+                let srcY = min(max(windowY + ty, 0), frameH - 1)
+                let row = (src + srcY * srcBPR).assumingMemoryBound(to: UInt16.self)
+                for tx in 0 ..< windowSize {
+                    let srcX = min(max(windowX + tx, 0), frameW - 1)
+                    let dstOff = (ty * windowSize + tx) * 3
+                    base[dstOff + 0] = Float(UInt16(littleEndian: row[srcX * 4 + 0])) * scale
+                    base[dstOff + 1] = Float(UInt16(littleEndian: row[srcX * 4 + 1])) * scale
+                    base[dstOff + 2] = Float(UInt16(littleEndian: row[srcX * 4 + 2])) * scale
                 }
             }
         }
@@ -637,32 +733,49 @@ private struct SeamAccumulator {
     /// Resolve and write every band row below `yEnd` into the destination, then slide the band
     /// so it starts at `yEnd`. Rows no tile ever covered are written as opaque black rather
     /// than left alone — the destination buffer's prior contents are never a valid answer.
-    mutating func flush(upTo yEnd: Int, dst: UnsafeMutablePointer<UInt8>, dstBPR: Int) {
+    mutating func flush(upTo yEnd: Int, dst rawDst: UnsafeMutableRawPointer, dstBPR: Int, deep: Bool = false) {
         let end = min(yEnd, outHeight)
         guard end > y0 else { return }
         let n = end - y0
+        let dst = rawDst.assumingMemoryBound(to: UInt8.self)
 
         colour.withUnsafeMutableBufferPointer { col in
             weight.withUnsafeMutableBufferPointer { wgt in
                 let c = col.baseAddress!, w = wgt.baseAddress!
-                for row in 0 ..< min(n, rows) {
-                    let dstRow = (y0 + row) * dstBPR
-                    for x in 0 ..< outWidth {
-                        let p = row * outWidth + x
-                        let sw = w[p]
-                        let d = dstRow + x * 4
-                        if sw > 0 {
-                            let inv = 1.0 / sw
-                            // Divide once, quantise once, ROUND — truncating here is what put a
-                            // one-sided −1 LSB bias in the overlap bands.
-                            let r = (max(0, min(1, c[p * 3 + 0] * inv)) * 255).rounded()
-                            let g = (max(0, min(1, c[p * 3 + 1] * inv)) * 255).rounded()
-                            let b = (max(0, min(1, c[p * 3 + 2] * inv)) * 255).rounded()
-                            dst[d + 0] = UInt8(b); dst[d + 1] = UInt8(g); dst[d + 2] = UInt8(r)
-                        } else {
-                            dst[d + 0] = 0; dst[d + 1] = 0; dst[d + 2] = 0
+                if deep {
+                    // The same divide-once, round-once resolve, into RGBA16 (`deepPixelFormat`).
+                    for row in 0 ..< min(n, rows) {
+                        let out = (rawDst + (y0 + row) * dstBPR).assumingMemoryBound(to: UInt16.self)
+                        for x in 0 ..< outWidth {
+                            let p = row * outWidth + x
+                            let sw = w[p]
+                            for ch in 0 ..< 3 {
+                                let v = sw > 0 ? (max(0, min(1, c[p * 3 + ch] / sw)) * 65535).rounded() : 0
+                                out[x * 4 + ch] = UInt16(v).littleEndian
+                            }
+                            out[x * 4 + 3] = UInt16.max
                         }
-                        dst[d + 3] = 255
+                    }
+                } else {
+                    for row in 0 ..< min(n, rows) {
+                        let dstRow = (y0 + row) * dstBPR
+                        for x in 0 ..< outWidth {
+                            let p = row * outWidth + x
+                            let sw = w[p]
+                            let d = dstRow + x * 4
+                            if sw > 0 {
+                                let inv = 1.0 / sw
+                                // Divide once, quantise once, ROUND — truncating here is what put a
+                                // one-sided −1 LSB bias in the overlap bands.
+                                let r = (max(0, min(1, c[p * 3 + 0] * inv)) * 255).rounded()
+                                let g = (max(0, min(1, c[p * 3 + 1] * inv)) * 255).rounded()
+                                let b = (max(0, min(1, c[p * 3 + 2] * inv)) * 255).rounded()
+                                dst[d + 0] = UInt8(b); dst[d + 1] = UInt8(g); dst[d + 2] = UInt8(r)
+                            } else {
+                                dst[d + 0] = 0; dst[d + 1] = 0; dst[d + 2] = 0
+                            }
+                            dst[d + 3] = 255
+                        }
                     }
                 }
                 // Slide: keep the still-open rows, zero what they vacate.

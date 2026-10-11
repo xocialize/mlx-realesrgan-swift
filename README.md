@@ -26,6 +26,16 @@ let resp = try await engine.run(ImageUpscaleRequest(image: smallImage)) as! Imag
 // resp.image — 4× .png; resp.appliedScale == 4
 ```
 
+## The shared tile driver at 16 bits
+
+`RealESRGANMLX.MLXTileProcessor` also drives RealPLKSR, NERVE and HEART. Since 0.8.0 it reads and writes 16 bits
+when it's handed a `kCVPixelFormatType_64RGBALE` buffer (`MLXTileProcessor.deepPixelFormat`). That's MLXToolKit's
+`.rawRGBA16` (contract 1.52.0, AB-A-0158): RGBA, 16 bits per component, little-endian, 0…65535. The output has the
+input's depth, and the seam composite is float32 either way. Every other input format takes the 8-bit BGRA path
+exactly as before. This package's own `imageUpscale` converter is still 8-bit; a package adopts the 16-bit boundary
+by decoding `.rawRGBA16` (and deep PNG) into a `deepPixelFormat` buffer and declaring
+`ToolDescriptor.rawImageFormats`.
+
 ## Consuming it
 
 Public + version-tagged on github.com/xocialize. Add by tagged URL:
