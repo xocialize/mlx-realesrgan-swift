@@ -24,7 +24,7 @@ let package = Package(
         .executable(name: "realesrgan-smoke", targets: ["RealESRGANSmoke"]),  // drive the package + measure split footprint
     ],
     dependencies: [
-        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.27.0"),
+        .package(url: "https://github.com/xocialize/mlx-engine-swift", from: "0.67.0"),  // contract 1.52.0: .rawRGBA16 + rawImageFormats
         .package(url: "https://github.com/xocialize/mlx-profiling.git", from: "0.1.0"),
         .package(url: "https://github.com/ml-explore/mlx-swift", from: "0.30.0"),
     ],
@@ -70,6 +70,7 @@ let package = Package(
             name: "MLXRealESRGANTests",
             dependencies: [
                 "MLXRealESRGAN",
+                "RealESRGANMLX",   // DeepBoundaryTests: deepPixelFormat
                 .product(name: "MLXToolKit", package: "mlx-engine-swift"),
                 .product(name: "MLXServeCore", package: "mlx-engine-swift"),
                 .product(name: "MLXServeConformance", package: "mlx-engine-swift"),

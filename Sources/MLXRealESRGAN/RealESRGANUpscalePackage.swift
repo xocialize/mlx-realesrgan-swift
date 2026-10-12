@@ -26,6 +26,10 @@ public enum RealESRGANPackageError: Error, Equatable {
 /// Native scale is **4×**. A request's `scale` of `nil` or `≥ 4` runs at native 4×; a sub-native
 /// `scale` (e.g. `2`) is honored by post-downsampling the native-4× result to `inputDim * scale`.
 /// The response's `appliedScale` always reports what actually ran (per the contract, callers verify it).
+///
+/// **16 bits end to end** (contract 1.52.0, AB-A-0158): the surface declares `.rawRGBA16`. A `.rawRGBA16` image, or a
+/// PNG/TIFF deeper than 8 bits, runs through the core's 16-bit tile path and comes back at 16 bits: `.rawRGBA16` for
+/// raw, a 16-bit PNG otherwise. 8-bit inputs take the 8-bit path byte for byte.
 @InferenceActor
 public final class RealESRGANUpscalePackage: ModelPackage {
     public typealias Configuration = RealESRGANConfiguration
@@ -58,6 +62,8 @@ public final class RealESRGANUpscalePackage: ModelPackage {
                     name: "realesrgan-upscale",
                     summary: "Real-ESRGAN (SRVGGNetCompact) 4x image super-resolution, tile-based."
                 )
+                // Mirrors rawBGRA8 and keeps 16 bits for rawRGBA16 and deep PNG (0.9.0).
+                .declaring(rawImageFormats: [.rawBGRA8, .rawRGBA16])
             ]
         )
     }
@@ -126,10 +132,14 @@ public final class RealESRGANUpscalePackage: ModelPackage {
         }
 
         let w = CVPixelBufferGetWidth(outPB), h = CVPixelBufferGetHeight(outPB)
-        // Output mirrors the input format: rawBGRA8 in ⇒ rawBGRA8 out (no re-encode); else .png.
+        // Output mirrors the input format: rawBGRA8 in ⇒ rawBGRA8 out, rawRGBA16 in ⇒ rawRGBA16 out (no re-encode);
+        // else .png — 16-bit when the input was deep, because the buffer then is.
         let outImage: Image
         if req.image.format == .rawBGRA8 {
             guard let raw = Self.encodeRawBGRA8(outPB) else { throw RealESRGANPackageError.imageEncodeFailed }
+            outImage = raw
+        } else if req.image.format == .rawRGBA16 {
+            guard let raw = Self.encodeRawRGBA16(outPB) else { throw RealESRGANPackageError.imageEncodeFailed }
             outImage = raw
         } else {
             guard let png = Self.encodePNG(outPB) else { throw RealESRGANPackageError.imageEncodeFailed }
@@ -140,13 +150,16 @@ public final class RealESRGANUpscalePackage: ModelPackage {
 
     // MARK: - Image codec
 
-    /// Decode a canonical `Image` (.png/.jpeg/.rawBGRA8) to a BGRA `CVPixelBuffer`.
+    /// Decode a canonical `Image` (.png/.jpeg/.rawBGRA8/.rawRGBA16) to a `CVPixelBuffer`: BGRA, or the tile driver's
+    /// 16-bit `deepPixelFormat` for `.rawRGBA16` and for an encoded image deeper than 8 bits per component.
     nonisolated static func decodeToPixelBuffer(_ image: Image) throws -> CVPixelBuffer {
         if image.format == .rawBGRA8 { return try rawBGRA8ToPixelBuffer(image) }
+        if image.format == .rawRGBA16 { return try rawRGBA16ToPixelBuffer(image) }
         guard let source = CGImageSourceCreateWithData(image.data as CFData, nil),
               let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
             throw RealESRGANPackageError.imageDecodeFailed("unreadable \(image.format.rawValue) data")
         }
+        if cg.bitsPerComponent > 8 { return try deepPixelBuffer(drawing: cg) }
         let w = cg.width, h = cg.height
         var pb: CVPixelBuffer?
         let attrs: [String: Any] = [
@@ -174,8 +187,15 @@ public final class RealESRGANUpscalePackage: ModelPackage {
         return buffer
     }
 
-    /// Encode a BGRA `CVPixelBuffer` as PNG bytes.
+    /// Encode a BGRA `CVPixelBuffer` as PNG bytes (a 16-bit PNG for a `deepPixelFormat` buffer).
     nonisolated static func encodePNG(_ pb: CVPixelBuffer) -> Data? {
+        if MLXTileProcessor.isDeep(pb) {
+            guard let cg = deepCGImage(pb) else { return nil }
+            let out = NSMutableData()
+            guard let dest = CGImageDestinationCreateWithData(out, UTType.png.identifier as CFString, 1, nil) else { return nil }
+            CGImageDestinationAddImage(dest, cg, nil)
+            return CGImageDestinationFinalize(dest) ? out as Data : nil
+        }
         let ci = CIImage(cvPixelBuffer: pb)
         let ctx = CIContext(options: [.cacheIntermediates: false])
         guard let cg = ctx.createCGImage(ci, from: ci.extent) else { return nil }
@@ -224,11 +244,16 @@ public final class RealESRGANUpscalePackage: ModelPackage {
         return buffer
     }
 
-    /// High-quality downsample of a 32BGRA `CVPixelBuffer` to `w`×`h` (a new 32BGRA buffer).
+    /// High-quality downsample of a 32BGRA `CVPixelBuffer` to `w`×`h` (a new 32BGRA buffer). A `deepPixelFormat` buffer
+    /// is resampled at 16 bits into a new one.
     /// Used to honor a requested `scale` below the model's native factor (BRIDGE-029).
     nonisolated static func resizePixelBuffer(_ src: CVPixelBuffer, toWidth w: Int, height h: Int) throws -> CVPixelBuffer {
         guard w > 0, h > 0 else {
             throw RealESRGANPackageError.imageEncodeFailed
+        }
+        if MLXTileProcessor.isDeep(src) {
+            guard let cg = deepCGImage(src) else { throw RealESRGANPackageError.imageEncodeFailed }
+            return try deepPixelBuffer(drawing: cg, width: w, height: h, interpolation: .high)
         }
         let ci = CIImage(cvPixelBuffer: src)
         let ctx = CIContext(options: [.cacheIntermediates: false])
@@ -279,6 +304,100 @@ public final class RealESRGANUpscalePackage: ModelPackage {
             }
         }
         return Image.rawBGRA8(data: out, width: w, height: h)
+    }
+
+    // MARK: - 16 bits (contract 1.52.0, AB-A-0158; the mlx-realplksr-swift 0.2.0 codec)
+
+    /// RGBA, 16 bits per component, little-endian, premultiplied — `.rawRGBA16`'s layout as CoreGraphics draws it.
+    nonisolated static let rgba16BitmapInfo =
+        CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder16Little.rawValue
+
+    nonisolated static func makeDeepPixelBuffer(_ w: Int, _ h: Int) throws -> CVPixelBuffer {
+        var pb: CVPixelBuffer?
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: MLXTileProcessor.deepPixelFormat,
+            kCVPixelBufferWidthKey as String: w,
+            kCVPixelBufferHeightKey as String: h,
+            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+        ]
+        guard CVPixelBufferCreate(nil, w, h, MLXTileProcessor.deepPixelFormat, attrs as CFDictionary, &pb) == kCVReturnSuccess,
+              let buffer = pb else {
+            throw RealESRGANPackageError.imageDecodeFailed("16-bit pixel buffer allocation (\(w)x\(h))")
+        }
+        return buffer
+    }
+
+    /// Draw `cg` into a new `deepPixelFormat` buffer, in sRGB at 16 bits (its own size unless given).
+    nonisolated static func deepPixelBuffer(drawing cg: CGImage, width: Int? = nil, height: Int? = nil,
+                                            interpolation: CGInterpolationQuality = .default) throws -> CVPixelBuffer {
+        let w = width ?? cg.width, h = height ?? cg.height
+        let buffer = try makeDeepPixelBuffer(w, h)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer),
+              let ctx = CGContext(
+                data: base, width: w, height: h, bitsPerComponent: 16,
+                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
+                space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: rgba16BitmapInfo) else {
+            throw RealESRGANPackageError.imageDecodeFailed("CGContext for RGBA16 draw")
+        }
+        ctx.interpolationQuality = interpolation
+        ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        return buffer
+    }
+
+    /// Wrap raw interleaved RGBA16 bytes straight into a `deepPixelFormat` buffer — no decode.
+    nonisolated static func rawRGBA16ToPixelBuffer(_ image: Image) throws -> CVPixelBuffer {
+        guard let w = image.width, let h = image.height, w > 0, h > 0 else {
+            throw RealESRGANPackageError.imageDecodeFailed("rawRGBA16 requires width/height")
+        }
+        let srcStride = image.bytesPerRow ?? (w * 8)
+        guard srcStride >= w * 8, image.data.count >= srcStride * h else {
+            throw RealESRGANPackageError.imageDecodeFailed(
+                "rawRGBA16 data too small (\(image.data.count) < \(srcStride * h))")
+        }
+        let buffer = try makeDeepPixelBuffer(w, h)
+        CVPixelBufferLockBaseAddress(buffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else {
+            throw RealESRGANPackageError.imageDecodeFailed("pixel buffer base address")
+        }
+        let dstStride = CVPixelBufferGetBytesPerRow(buffer)
+        image.data.withUnsafeBytes { (src: UnsafeRawBufferPointer) in
+            guard let srcBase = src.baseAddress else { return }
+            for row in 0..<h {
+                memcpy(base.advanced(by: row * dstStride), srcBase.advanced(by: row * srcStride), w * 8)
+            }
+        }
+        return buffer
+    }
+
+    /// A `deepPixelFormat` buffer as a 16-bit sRGB `CGImage` over a copy of its pixels.
+    nonisolated static func deepCGImage(_ pb: CVPixelBuffer) -> CGImage? {
+        guard let raw = encodeRawRGBA16(pb), let provider = CGDataProvider(data: raw.data as CFData) else { return nil }
+        return CGImage(width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb), bitsPerComponent: 16,
+                       bitsPerPixel: 64, bytesPerRow: CVPixelBufferGetWidth(pb) * 8,
+                       space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGBitmapInfo(rawValue: rgba16BitmapInfo),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)
+    }
+
+    /// Emit a `deepPixelFormat` buffer as tightly-packed `.rawRGBA16` bytes.
+    nonisolated static func encodeRawRGBA16(_ pb: CVPixelBuffer) -> Image? {
+        let w = CVPixelBufferGetWidth(pb), h = CVPixelBufferGetHeight(pb)
+        guard w > 0, h > 0, MLXTileProcessor.isDeep(pb) else { return nil }
+        CVPixelBufferLockBaseAddress(pb, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(pb) else { return nil }
+        let srcStride = CVPixelBufferGetBytesPerRow(pb)
+        let dstStride = w * 8
+        var out = Data(count: dstStride * h)
+        out.withUnsafeMutableBytes { (dst: UnsafeMutableRawBufferPointer) in
+            guard let dstBase = dst.baseAddress else { return }
+            for row in 0..<h {
+                memcpy(dstBase.advanced(by: row * dstStride), base.advanced(by: row * srcStride), dstStride)
+            }
+        }
+        return Image.rawRGBA16(data: out, width: w, height: h)
     }
 }
 

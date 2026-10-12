@@ -32,9 +32,25 @@ let resp = try await engine.run(ImageUpscaleRequest(image: smallImage)) as! Imag
 when it's handed a `kCVPixelFormatType_64RGBALE` buffer (`MLXTileProcessor.deepPixelFormat`). That's MLXToolKit's
 `.rawRGBA16` (contract 1.52.0, AB-A-0158): RGBA, 16 bits per component, little-endian, 0…65535. The output has the
 input's depth, and the seam composite is float32 either way. Every other input format takes the 8-bit BGRA path
-exactly as before. This package's own `imageUpscale` converter is still 8-bit; a package adopts the 16-bit boundary
-by decoding `.rawRGBA16` (and deep PNG) into a `deepPixelFormat` buffer and declaring
-`ToolDescriptor.rawImageFormats`.
+exactly as before. A package adopts the 16-bit boundary by decoding `.rawRGBA16` (and deep PNG) into a
+`deepPixelFormat` buffer and declaring `ToolDescriptor.rawImageFormats`.
+
+## 16 bits end to end (0.9.0)
+
+This package's own `imageUpscale` converter adopts the boundary too (AB-T-0229). The surface declares
+`ToolDescriptor.rawImageFormats = [.rawBGRA8, .rawRGBA16]` (MLXToolKit contract 1.52.0, mlx-engine-swift ≥ 0.67.0).
+- A `.rawRGBA16` image comes back `.rawRGBA16`, and a PNG or TIFF deeper than 8 bits comes back as a 16-bit PNG.
+- The network is fp32, so the output carries the model's full precision. The sub-native `scale` resample runs at 16
+  bits too.
+- 8-bit inputs take the 8-bit path unchanged.
+
+Gates (2026-10-11, M5 Max):
+- **8-bit byte identity:** Release builds on the GPU, against v0.8.1, 4 images × {whole-frame, tiled} × {png ×4,
+  png ×2, rawBGRA8 ×4}: 24/24 outputs byte-identical.
+- **16 bits agree with 8 bits:** an 8-bit image widened exactly to 16 bits rounds back to the 8-bit run's output
+  except at rounding boundaries (≤ 0.002% of values, max 0.502 of a step).
+- **G-6 direct gate** (the AB-R-0489 set): the 16-bit output's smooth-area flat-neighbour share is 0.000–0.128,
+  at or below the 16-bit interpolation's 0.015–0.165 on every image, so no 8-bit staircase.
 
 ## Consuming it
 
