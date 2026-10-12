@@ -1,4 +1,5 @@
 import Foundation
+import Accelerate
 import CoreGraphics
 import CoreImage
 import CoreVideo
@@ -244,46 +245,48 @@ public final class RealESRGANUpscalePackage: ModelPackage {
         return buffer
     }
 
-    /// High-quality downsample of a 32BGRA `CVPixelBuffer` to `w`×`h` (a new 32BGRA buffer). A `deepPixelFormat` buffer
-    /// is resampled at 16 bits into a new one.
-    /// Used to honor a requested `scale` below the model's native factor (BRIDGE-029).
+    /// Lanczos downsample of a `CVPixelBuffer` to `w`×`h`: a new buffer in the source's format, 32BGRA or the 16-bit
+    /// `deepPixelFormat` (vImage; AB-T-0232, the AB-T-0225 fix). The CoreGraphics `.high` draw this replaces sampled on
+    /// a corner-aligned grid, so a reduction drifted ±0.26 px from the centre to the edges, which cost RealPLKSR and
+    /// HEART 1.7–2.8 dB at ×2 (AB-R-0502). vImage's Lanczos is centre-aligned and matches PIL's to 0.02 dB.
     nonisolated static func resizePixelBuffer(_ src: CVPixelBuffer, toWidth w: Int, height h: Int) throws -> CVPixelBuffer {
-        guard w > 0, h > 0 else {
-            throw RealESRGANPackageError.imageEncodeFailed
+        guard w > 0, h > 0 else { throw RealESRGANPackageError.imageEncodeFailed }
+        let deep = MLXTileProcessor.isDeep(src)
+        let buffer: CVPixelBuffer
+        if deep {
+            buffer = try makeDeepPixelBuffer(w, h)
+        } else {
+            var pb: CVPixelBuffer?
+            let attrs: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: w,
+                kCVPixelBufferHeightKey as String: h,
+                kCVPixelBufferIOSurfacePropertiesKey as String: [:],
+            ]
+            guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb) == kCVReturnSuccess,
+                  let made = pb else {
+                throw RealESRGANPackageError.imageEncodeFailed
+            }
+            buffer = made
         }
-        if MLXTileProcessor.isDeep(src) {
-            guard let cg = deepCGImage(src) else { throw RealESRGANPackageError.imageEncodeFailed }
-            return try deepPixelBuffer(drawing: cg, width: w, height: h, interpolation: .high)
-        }
-        let ci = CIImage(cvPixelBuffer: src)
-        let ctx = CIContext(options: [.cacheIntermediates: false])
-        guard let cg = ctx.createCGImage(ci, from: ci.extent) else {
-            throw RealESRGANPackageError.imageEncodeFailed
-        }
-        var pb: CVPixelBuffer?
-        let attrs: [String: Any] = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-            kCVPixelBufferWidthKey as String: w,
-            kCVPixelBufferHeightKey as String: h,
-            kCVPixelBufferIOSurfacePropertiesKey as String: [:],
-        ]
-        guard CVPixelBufferCreate(nil, w, h, kCVPixelFormatType_32BGRA, attrs as CFDictionary, &pb) == kCVReturnSuccess,
-              let buffer = pb else {
-            throw RealESRGANPackageError.imageEncodeFailed
-        }
+        CVPixelBufferLockBaseAddress(src, .readOnly)
         CVPixelBufferLockBaseAddress(buffer, [])
-        defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
-        guard let base = CVPixelBufferGetBaseAddress(buffer),
-              let outCtx = CGContext(
-                data: base, width: w, height: h, bitsPerComponent: 8,
-                bytesPerRow: CVPixelBufferGetBytesPerRow(buffer),
-                space: CGColorSpace(name: CGColorSpace.sRGB)!,
-                bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                    | CGBitmapInfo.byteOrder32Little.rawValue) else {
+        defer {
+            CVPixelBufferUnlockBaseAddress(buffer, [])
+            CVPixelBufferUnlockBaseAddress(src, .readOnly)
+        }
+        guard let srcBase = CVPixelBufferGetBaseAddress(src), let dstBase = CVPixelBufferGetBaseAddress(buffer) else {
             throw RealESRGANPackageError.imageEncodeFailed
         }
-        outCtx.interpolationQuality = .high
-        outCtx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+        var s = vImage_Buffer(data: srcBase, height: vImagePixelCount(CVPixelBufferGetHeight(src)),
+                              width: vImagePixelCount(CVPixelBufferGetWidth(src)), rowBytes: CVPixelBufferGetBytesPerRow(src))
+        var d = vImage_Buffer(data: dstBase, height: vImagePixelCount(h), width: vImagePixelCount(w),
+                              rowBytes: CVPixelBufferGetBytesPerRow(buffer))
+        // Four interleaved channels either way, each filtered alike, so BGRA and RGBA order both hold; premultiplied
+        // alpha resamples correctly as is.
+        let err = deep ? vImageScale_ARGB16U(&s, &d, nil, vImage_Flags(kvImageNoFlags))
+                       : vImageScale_ARGB8888(&s, &d, nil, vImage_Flags(kvImageNoFlags))
+        guard err == kvImageNoError else { throw RealESRGANPackageError.imageEncodeFailed }
         return buffer
     }
 

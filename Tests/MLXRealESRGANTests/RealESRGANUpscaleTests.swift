@@ -145,6 +145,47 @@ struct RealESRGANUpscaleTests {
         #expect(raw.data.count == 32 * 32 * 4)
     }
 
+    /// AB-T-0232 (the AB-T-0225 fix, here): the sub-native reduction stays registered across the whole frame, at 8 and
+    /// at 16 bits. 2×2 white blocks on black near both corners and at the centre must stay centred on their output
+    /// pixel. The CoreGraphics `.high` draw this replaced drifted ±0.26 px toward the edges (AB-R-0502).
+    @Test(arguments: [false, true]) func resizeStaysRegisteredAcrossTheFrame(deep: Bool) throws {
+        let n = 512, spots = [8, 256, 496]
+        let image = Self.blocksImage(n: n, spots: spots, deep: deep)
+        let pb = try RealESRGANUpscalePackage.decodeToPixelBuffer(image)
+        let scaled = try RealESRGANUpscalePackage.resizePixelBuffer(pb, toWidth: n / 2, height: n / 2)
+        #expect(CVPixelBufferGetPixelFormatType(scaled) == CVPixelBufferGetPixelFormatType(pb))
+        CVPixelBufferLockBaseAddress(scaled, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(scaled, .readOnly) }
+        let base = try #require(CVPixelBufferGetBaseAddress(scaled))
+        let stride = CVPixelBufferGetBytesPerRow(scaled)
+        func value(_ x: Int, _ y: Int) -> Double {
+            deep ? Double(base.loadUnaligned(fromByteOffset: y * stride + x * 8, as: UInt16.self))
+                 : Double(base.loadUnaligned(fromByteOffset: y * stride + x * 4, as: UInt8.self))
+        }
+        for p in spots {
+            let c = p / 2
+            var sum = 0.0, sx = 0.0, sy = 0.0
+            for y in (c - 4)...(c + 4) {
+                for x in (c - 4)...(c + 4) { let v = value(x, y); sum += v; sx += v * Double(x); sy += v * Double(y) }
+            }
+            #expect(abs(sx / sum - Double(c)) < 0.02 && abs(sy / sum - Double(c)) < 0.02,
+                    "block at \(p): centroid (\(sx / sum), \(sy / sum)), want (\(c), \(c))")
+        }
+    }
+
+    /// Opaque black n×n with 2×2 white blocks at (p, p) for each spot: rawBGRA8, or rawRGBA16 when `deep`.
+    static func blocksImage(n: Int, spots: [Int], deep: Bool) -> Image {
+        func white(_ x: Int, _ y: Int) -> Bool { spots.contains { (($0)..<($0 + 2)).contains(x) && (($0)..<($0 + 2)).contains(y) } }
+        if deep {
+            var words = [UInt16](repeating: 0, count: n * n * 4)
+            for y in 0..<n { for x in 0..<n { for c in 0..<4 where c == 3 || white(x, y) { words[(y * n + x) * 4 + c] = .max } } }
+            return .rawRGBA16(data: words.withUnsafeBytes { Data($0) }, width: n, height: n)
+        }
+        var bytes = [UInt8](repeating: 0, count: n * n * 4)
+        for y in 0..<n { for x in 0..<n { for c in 0..<4 where c == 3 || white(x, y) { bytes[(y * n + x) * 4 + c] = 255 } } }
+        return .rawBGRA8(data: Data(bytes), width: n, height: n)
+    }
+
     static func makePNG(width: Int, height: Int) -> Data? {
         guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8,
                                   bytesPerRow: 0, space: CGColorSpace(name: CGColorSpace.sRGB)!,
